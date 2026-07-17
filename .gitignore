@@ -7,7 +7,7 @@
 RsyncGlass.app/
 ## User settings
 xcuserdata/
-
+*.app
 ## Obj-C/Swift specific
 *.hmap
 
