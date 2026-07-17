@@ -8,6 +8,7 @@ struct EndpointEditor: View {
     @State private var isTesting = false
     @State private var showSaveSheet = false
     @State private var showManageSheet = false
+    @State private var showRemoteBrowser = false
     @State private var saveName = ""
 
     var body: some View {
@@ -37,6 +38,11 @@ struct EndpointEditor: View {
         }
         .sheet(isPresented: $showManageSheet) {
             manageServersSheet
+        }
+        .sheet(isPresented: $showRemoteBrowser) {
+            RemoteBrowserSheet(endpoint: endpoint) { chosenPath in
+                endpoint.remotePath = chosenPath
+            }
         }
     }
 
@@ -170,6 +176,8 @@ struct EndpointEditor: View {
                     Text("Path").frame(width: 60, alignment: .leading).font(.caption)
                     TextField("/remote/path", text: $endpoint.remotePath)
                         .fieldStyle()
+                    Button("Browse…") { showRemoteBrowser = true }
+                        .disabled(endpoint.host.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
 
