@@ -1,15 +1,27 @@
 import SwiftUI
 import AppKit
 
+/// The sheet an EndpointEditor can present. Using one `.sheet(item:)` bound to
+/// this instead of three separate `.sheet(isPresented:)` modifiers matters:
+/// SwiftUI on macOS doesn't reliably present multiple boolean-driven sheets
+/// stacked on the same view — once one has been shown, others attached the
+/// same way can silently stop presenting.
+private enum EndpointSheet: Identifiable {
+    case save
+    case manage
+    case browse
+    case editServer
+    var id: Self { self }
+}
+
 struct EndpointEditor: View {
     @Bindable var endpoint: Endpoint
     var serverStore: ServerStore
     @State private var testResult: String?
     @State private var isTesting = false
-    @State private var showSaveSheet = false
-    @State private var showManageSheet = false
-    @State private var showRemoteBrowser = false
+    @State private var activeSheet: EndpointSheet?
     @State private var saveName = ""
+    @State private var editingServer: SavedServer?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -33,15 +45,27 @@ struct EndpointEditor: View {
         }
         .frame(minWidth: 340)
         .glassPanel()
-        .sheet(isPresented: $showSaveSheet) {
-            saveServerSheet
-        }
-        .sheet(isPresented: $showManageSheet) {
-            manageServersSheet
-        }
-        .sheet(isPresented: $showRemoteBrowser) {
-            RemoteBrowserSheet(endpoint: endpoint) { chosenPath in
-                endpoint.remotePath = chosenPath
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .save:
+                saveServerSheet
+            case .manage:
+                manageServersSheet
+            case .browse:
+                RemoteBrowserSheet(endpoint: endpoint) { chosenPath in
+                    endpoint.remotePath = chosenPath
+                }
+            case .editServer:
+                if let editingServer {
+                    EditServerSheet(
+                        server: editingServer,
+                        onSave: { updated in
+                            serverStore.upsert(updated)
+                            activeSheet = .manage
+                        },
+                        onCancel: { activeSheet = .manage }
+                    )
+                }
             }
         }
     }
@@ -58,7 +82,7 @@ struct EndpointEditor: View {
                 .foregroundStyle(.secondary)
             HStack {
                 Spacer()
-                Button("Cancel") { showSaveSheet = false }
+                Button("Cancel") { activeSheet = nil }
                 Button("Save") { saveCurrentServer() }
                     .buttonStyle(.borderedProminent)
                     .disabled(saveName.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -74,7 +98,7 @@ struct EndpointEditor: View {
                 Text("Saved Servers")
                     .font(.headline)
                 Spacer()
-                Button("Done") { showManageSheet = false }
+                Button("Done") { activeSheet = nil }
             }
             .padding()
 
@@ -95,6 +119,13 @@ struct EndpointEditor: View {
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
+                            Button {
+                                editingServer = server
+                                activeSheet = .editServer
+                            } label: {
+                                Image(systemName: "pencil")
+                            }
+                            .buttonStyle(.borderless)
                             Button {
                                 serverStore.delete(server)
                             } label: {
@@ -134,7 +165,7 @@ struct EndpointEditor: View {
                         }
                     }
                     Divider()
-                    Button("Manage Saved Servers…") { showManageSheet = true }
+                    Button("Manage Saved Servers…") { activeSheet = .manage }
                 } label: {
                     Label("Saved Servers", systemImage: "server.rack")
                         .font(.caption)
@@ -146,7 +177,7 @@ struct EndpointEditor: View {
 
                 Button {
                     saveName = endpoint.host
-                    showSaveSheet = true
+                    activeSheet = .save
                 } label: {
                     Label("Save", systemImage: "plus.circle")
                         .font(.caption)
@@ -176,7 +207,7 @@ struct EndpointEditor: View {
                     Text("Path").frame(width: 60, alignment: .leading).font(.caption)
                     TextField("/remote/path", text: $endpoint.remotePath)
                         .fieldStyle()
-                    Button("Browse…") { showRemoteBrowser = true }
+                    Button("Browse…") { activeSheet = .browse }
                         .disabled(endpoint.host.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
@@ -261,7 +292,7 @@ struct EndpointEditor: View {
             KeychainService.deletePassword(forServerID: server.id)
         }
         saveName = ""
-        showSaveSheet = false
+        activeSheet = nil
     }
 
     private func browseFolder() {
