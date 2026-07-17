@@ -11,6 +11,12 @@ let package = Package(
             name: "RsyncGlass",
             path: "Sources/RsyncGlass",
             swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "RsyncGlassTests",
+            dependencies: ["RsyncGlass"],
+            path: "Tests/RsyncGlassTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
 )

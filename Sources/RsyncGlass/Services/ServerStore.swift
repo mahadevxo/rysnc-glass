@@ -4,9 +4,11 @@ import Foundation
 final class ServerStore {
     private static let defaultsKey = "com.local.rsyncglass.savedServers"
 
+    private let defaults: UserDefaults
     var servers: [SavedServer] = []
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         load()
     }
 
@@ -29,12 +31,12 @@ final class ServerStore {
     }
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: Self.defaultsKey) else { return }
+        guard let data = defaults.data(forKey: Self.defaultsKey) else { return }
         servers = (try? JSONDecoder().decode([SavedServer].self, from: data)) ?? []
     }
 
     private func persist() {
         guard let data = try? JSONEncoder().encode(servers) else { return }
-        UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        defaults.set(data, forKey: Self.defaultsKey)
     }
 }

@@ -37,13 +37,22 @@ enum RemoteBrowser {
         let process = try SSHConnectionBuilder.makeProcess(for: endpoint, remoteCommand: remoteCommand)
         let result = try await ProcessRunner.run(process)
 
-        guard result.exitCode == 0, let markerRange = result.stdout.range(of: marker) else {
+        guard result.exitCode == 0 else {
             throw RemoteBrowserError.listingFailed(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
         }
+        return try parse(stdout: result.stdout, marker: marker)
+    }
 
-        let resolvedPath = String(result.stdout[result.stdout.startIndex..<markerRange.lowerBound])
+    /// Pure parsing of the `pwd && echo <marker> && ls -1AFL` output, split out
+    /// from the SSH round-trip above so it's testable without a live connection.
+    static func parse(stdout: String, marker: String) throws -> Listing {
+        guard let markerRange = stdout.range(of: marker) else {
+            throw RemoteBrowserError.listingFailed("")
+        }
+
+        let resolvedPath = String(stdout[stdout.startIndex..<markerRange.lowerBound])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let listingText = result.stdout[markerRange.upperBound...]
+        let listingText = stdout[markerRange.upperBound...]
 
         var entries: [RemoteEntry] = []
         for line in listingText.split(separator: "\n") {

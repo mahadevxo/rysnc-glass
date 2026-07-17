@@ -63,4 +63,21 @@ final class Endpoint {
         let p = overridePath ?? remotePath
         return "\(username)@\(host):\(p)"
     }
+
+    /// A normalized identity string for detecting when source and target
+    /// point at the same place (same local path, or same remote user@host:path).
+    var resolvedLocationKey: String {
+        var p = path.trimmingCharacters(in: .whitespaces)
+        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
+        return isRemote ? "\(username)@\(host):\(port)/\(p)" : "local:\(p)"
+    }
+
+    /// Swaps every field except `label`, so this endpoint keeps its identity
+    /// (e.g. "Source" stays "Source") while its configured location swaps with `other`.
+    func swapContents(with other: Endpoint) {
+        let mine = (kind, localPath, host, port, username, remotePath, authMethod, keyPath, password)
+        (kind, localPath, host, port, username, remotePath, authMethod, keyPath, password) =
+            (other.kind, other.localPath, other.host, other.port, other.username, other.remotePath, other.authMethod, other.keyPath, other.password)
+        (other.kind, other.localPath, other.host, other.port, other.username, other.remotePath, other.authMethod, other.keyPath, other.password) = mine
+    }
 }

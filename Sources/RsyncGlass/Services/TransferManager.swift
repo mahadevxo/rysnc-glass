@@ -10,6 +10,8 @@ final class TransferManager {
     // a rapid double-click spawning two overlapping jobs in that gap.
     private var jobInFlight = false
 
+    var isTransferActive: Bool { jobInFlight }
+
     func start(source: Endpoint, target: Endpoint, options: RsyncOptions) {
         guard !jobInFlight else { return }
         jobInFlight = true

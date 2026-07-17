@@ -10,6 +10,8 @@ A native macOS app for `rsync` transfers — local↔local, local↔SSH remote, 
 - Real parallel transfers — splits the source into N size-balanced groups and runs N `rsync` processes concurrently over separate connections
 - Resumes interrupted transfers (`--partial`) instead of starting over
 - Standard `rsync` options: compression, archive mode, delete-extraneous, dry run, bandwidth limit, exclude patterns, extra flags
+- Swap button to flip source/target, and confirmation prompts before a transfer that would delete files or where source and target point at the same place
+- Warns before quitting mid-transfer instead of silently orphaning the running `rsync`/`ssh` processes
 
 ## Requirements
 
@@ -41,7 +43,18 @@ swift run
 
 (You may need `export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"` first if `xcode-select` currently points at Command Line Tools rather than full Xcode.)
 
+## Testing
+
+```sh
+./run_tests.sh
+```
+
+Runs the full test suite (`Tests/RsyncGlassTests`), including integration tests that spin up real local `rsync` processes to verify parallel-stream splitting, resume-after-cancel, and the remote-to-remote relay routing — not just pure-logic unit tests.
+
+This is a wrapper around `swift test` rather than calling it directly, because on some Macs Finder/Spotlight tags a freshly-built `.xctest` bundle with a `com.apple.FinderInfo` xattr fast enough to make `codesign` reject it mid-build ("resource fork ... detritus not allowed"). If you ever see that error running `swift test` yourself, use `./run_tests.sh` instead.
+
 ## Notes
 
 - rsync can't transfer directly between two remote hosts. If both source and target are remote, RsyncGlass relays through a local staging folder automatically (download → stage → upload) — this shows up as "Stage 1 of 2" / "Stage 2 of 2" in the transfer log.
 - The app is ad-hoc signed only, not notarized. That's fine for building and running on your own Mac, but if you hand the built `.app` file to someone else directly (rather than having them build it themselves), Gatekeeper will likely flag it — they'd need to right-click → Open, or clear the quarantine attribute (`xattr -cr RsyncGlass.app`).
+- If `./build_app.sh` prints a `resource fork, Finder information, or similar detritus not allowed` warning during codesigning, that's the same Finder-tagging quirk mentioned above — it's non-fatal for `build_app.sh` (ad-hoc signing an app bundle tolerates it; only the stricter test-bundle signing step fails outright), and the built app still runs fine.
