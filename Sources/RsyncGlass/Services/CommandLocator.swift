@@ -15,6 +15,13 @@ enum CommandLocator {
         "/sbin",
     ]
 
+    /// build_app.sh copies rsync/sshpass in here when it finds them on the
+    /// build machine, so the shipped .app works without Homebrew installed.
+    /// Checked first so a bundled copy wins over whatever's on the system.
+    private static var bundledBinDir: String {
+        Bundle.main.bundlePath + "/Contents/Resources/bin"
+    }
+
     private static var cache: [String: String?] = [:]
 
     static func find(_ binary: String) -> String? {
@@ -22,6 +29,11 @@ enum CommandLocator {
             return cached
         }
         let fm = FileManager.default
+        let bundled = bundledBinDir + "/" + binary
+        if fm.isExecutableFile(atPath: bundled) {
+            cache[binary] = bundled
+            return bundled
+        }
         for dir in searchDirs {
             let candidate = dir + "/" + binary
             if fm.isExecutableFile(atPath: candidate) {
