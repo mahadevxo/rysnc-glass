@@ -12,6 +12,7 @@ final class RsyncOptions {
     var bandwidthLimitKBps: String = "" // --bwlimit, empty = unlimited
     var extraArgs: String = ""        // free-form additional flags
     var streamCount: Int = 1          // number of parallel rsync processes
+    var pipelineRelayLegs: Bool = false // remote-to-remote only: overlap each item's upload with the next item's download
 
     var excludeList: [String] {
         excludePatterns

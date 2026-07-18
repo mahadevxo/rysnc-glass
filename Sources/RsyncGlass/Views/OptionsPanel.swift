@@ -2,6 +2,7 @@ import SwiftUI
 
 struct OptionsPanel: View {
     @Bindable var options: RsyncOptions
+    var isRemoteToRemote: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -57,6 +58,18 @@ struct OptionsPanel: View {
                 Text("Splits the source's top-level items into \(options.streamCount) size-balanced group\(options.streamCount == 1 ? "" : "s") transferred over separate connections at once.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if isRemoteToRemote {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Overlap upload with next download (relay)", isOn: $options.pipelineRelayLegs)
+                        .toggleStyle(.switch)
+                    Text(options.pipelineRelayLegs
+                         ? "Faster — while one item uploads to the target, the next item is already downloading. Uses roughly double the local disk per stream at any moment."
+                         : "One item at a time per stream: fully downloaded, then uploaded, then deleted from local staging before starting the next. Lowest disk use — lets a transfer larger than this Mac's free space complete.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

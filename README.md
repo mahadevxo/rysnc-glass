@@ -9,6 +9,7 @@ A native macOS app for `rsync` transfers — local↔local, local↔SSH remote, 
 - Browse button for remote paths — navigates the remote filesystem live over SSH, no need to type paths blind
 - Real parallel transfers — splits the source into N size-balanced groups and runs N `rsync` processes concurrently over separate connections
 - Resumes interrupted transfers (`--partial`) instead of starting over
+- Remote-to-remote transfers relay item by item, deleting each item from local staging as soon as it's confirmed on the target — so a transfer can move more data than fits on this Mac's free disk at once. Optionally overlaps each item's upload with the next item's download for speed, at the cost of roughly double the peak local disk per stream
 - Standard `rsync` options: compression, archive mode, delete-extraneous, dry run, bandwidth limit, exclude patterns, extra flags
 - Swap button to flip source/target, and confirmation prompts before a transfer that would delete files or where source and target point at the same place
 - Warns before quitting mid-transfer instead of silently orphaning the running `rsync`/`ssh` processes
@@ -55,6 +56,6 @@ This is a wrapper around `swift test` rather than calling it directly, because o
 
 ## Notes
 
-- rsync can't transfer directly between two remote hosts. If both source and target are remote, RsyncGlass relays through a local staging folder automatically (download → stage → upload) — this shows up as "Stage 1 of 2" / "Stage 2 of 2" in the transfer log.
+- rsync can't transfer directly between two remote hosts. If both source and target are remote, RsyncGlass relays through a local staging folder automatically, one top-level item at a time — each item is downloaded, uploaded, and then deleted from staging before moving to the next, so the transfer isn't bounded by this Mac's free disk space. The "Overlap upload with next download" option in the Options panel trades some of that disk headroom for speed by starting the next item's download while the current one is still uploading. A small manifest in the staging folder tracks which items already finished, so resuming an interrupted relay skips them instead of re-downloading. Dry run only ever previews the download leg — nothing is actually uploaded or deleted from staging.
 - The app is ad-hoc signed only, not notarized. That's fine for building and running on your own Mac, but if you hand the built `.app` file to someone else directly (rather than having them build it themselves), Gatekeeper will likely flag it — they'd need to right-click → Open, or clear the quarantine attribute (`xattr -cr RsyncGlass.app`).
 - If `./build_app.sh` prints a `resource fork, Finder information, or similar detritus not allowed` warning during codesigning, that's the same Finder-tagging quirk mentioned above — it's non-fatal for `build_app.sh` (ad-hoc signing an app bundle tolerates it; only the stricter test-bundle signing step fails outright), and the built app still runs fine.

@@ -227,6 +227,257 @@ final class TransferManagerTests: XCTestCase {
         XCTAssertEqual(manager.state.phase, .idle)
     }
 
+    // MARK: - Remote-to-remote relay: item-by-item disk-bounded pipeline
+    //
+    // These call TransferManager.runRelayDirectory/runRelaySingleFile directly
+    // with local-kind endpoints rather than through the public start() API.
+    // The real remote-to-remote path additionally requires two reachable SSH
+    // hosts (exercised only for the failure/routing case below, using an
+    // unreachable host); there's no SSH loopback available in this test
+    // environment. What's new and worth verifying here — item-by-item
+    // relaying that deletes each item from staging as soon as it lands on
+    // the target, so a transfer can exceed this Mac's free disk — is
+    // orchestration logic in TransferManager that doesn't care whether the
+    // underlying rsync process happens to go over SSH or a local path.
+
+    func testDirectoryRelaySequentialNeverHoldsMoreThanOneItemInStagingAtOnce() async throws {
+        let source = testDir.appendingPathComponent("relay-seq-src")
+        let staging = testDir.appendingPathComponent("relay-seq-staging")
+        let target = testDir.appendingPathComponent("relay-seq-dst")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        let itemCount = 3
+        for i in 0..<itemCount {
+            let data = Data(repeating: UInt8(i + 1), count: 1_500_000) // 1.5MB, distinct byte per item
+            try data.write(to: source.appendingPathComponent("item\(i)"))
+        }
+
+        let options = RsyncOptions()
+        options.streamCount = 1
+        options.compress = false // repeated-byte content would defeat --bwlimit's throttling otherwise
+        options.bandwidthLimitKBps = "1500" // ~1.5MB/s, so each leg of each item takes ~1s
+
+        let manager = TransferManager()
+        var maxObservedStagingItems = 0
+        let pollTask = Task {
+            while !Task.isCancelled {
+                // Exclude the relayed-items manifest — it's bookkeeping for
+                // resume-skip, not one of the data items being disk-bounded.
+                let count = (try? FileManager.default.contentsOfDirectory(atPath: staging.path).filter { $0 != ".rsyncglass-relayed-items" }.count) ?? 0
+                maxObservedStagingItems = max(maxObservedStagingItems, count)
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+
+        let outcome = await manager.runRelayDirectory(
+            source: localEndpoint(label: "Source", path: source),
+            staging: localEndpoint(label: "Staging", path: staging),
+            target: localEndpoint(label: "Target", path: target),
+            options: options
+        )
+        pollTask.cancel()
+
+        XCTAssertEqual(outcome, .success)
+        XCTAssertLessThanOrEqual(maxObservedStagingItems, 1, "sequential relay should process one item at a time per stream — never the whole set at once")
+
+        let remainingStagingItems = try FileManager.default.contentsOfDirectory(atPath: staging.path).filter { $0 != ".rsyncglass-relayed-items" }
+        XCTAssertTrue(remainingStagingItems.isEmpty, "every item should be deleted from staging once it's relayed")
+
+        for i in 0..<itemCount {
+            let expected = Data(repeating: UInt8(i + 1), count: 1_500_000)
+            let actual = try Data(contentsOf: target.appendingPathComponent("item\(i)"))
+            XCTAssertEqual(actual, expected, "item\(i) should be byte-identical after relay")
+        }
+    }
+
+    func testDirectoryRelayPipelinedOverlapsButStaysDiskBoundedAndCorrect() async throws {
+        let source = testDir.appendingPathComponent("relay-pipe-src")
+        let staging = testDir.appendingPathComponent("relay-pipe-staging")
+        let target = testDir.appendingPathComponent("relay-pipe-dst")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        let itemCount = 3
+        for i in 0..<itemCount {
+            let data = Data(repeating: UInt8(i + 1), count: 1_500_000)
+            try data.write(to: source.appendingPathComponent("item\(i)"))
+        }
+
+        let options = RsyncOptions()
+        options.streamCount = 1
+        options.compress = false
+        options.bandwidthLimitKBps = "1500"
+        options.pipelineRelayLegs = true
+
+        let manager = TransferManager()
+        var maxObservedStagingItems = 0
+        let pollTask = Task {
+            while !Task.isCancelled {
+                // Exclude the relayed-items manifest — it's bookkeeping for
+                // resume-skip, not one of the data items being disk-bounded.
+                let count = (try? FileManager.default.contentsOfDirectory(atPath: staging.path).filter { $0 != ".rsyncglass-relayed-items" }.count) ?? 0
+                maxObservedStagingItems = max(maxObservedStagingItems, count)
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+
+        let outcome = await manager.runRelayDirectory(
+            source: localEndpoint(label: "Source", path: source),
+            staging: localEndpoint(label: "Staging", path: staging),
+            target: localEndpoint(label: "Target", path: target),
+            options: options
+        )
+        pollTask.cancel()
+
+        XCTAssertEqual(outcome, .success)
+        // Pipelined mode overlaps upload(i) with download(i+1), so up to two
+        // items can exist in staging at once — but never the whole set.
+        XCTAssertLessThanOrEqual(maxObservedStagingItems, 2, "pipelined relay overlaps by at most one item ahead")
+        XCTAssertLessThan(maxObservedStagingItems, itemCount, "pipelined relay should still never hold every item in staging at once")
+
+        let remainingStagingItems = try FileManager.default.contentsOfDirectory(atPath: staging.path).filter { $0 != ".rsyncglass-relayed-items" }
+        XCTAssertTrue(remainingStagingItems.isEmpty)
+
+        for i in 0..<itemCount {
+            let expected = Data(repeating: UInt8(i + 1), count: 1_500_000)
+            let actual = try Data(contentsOf: target.appendingPathComponent("item\(i)"))
+            XCTAssertEqual(actual, expected, "item\(i) should be byte-identical after a pipelined relay")
+        }
+    }
+
+    func testSingleFileRelayDownloadsThenUploadsSuccessfully() async throws {
+        let source = testDir.appendingPathComponent("relay-sf-src")
+        let staging = testDir.appendingPathComponent("relay-sf-staging")
+        let target = testDir.appendingPathComponent("relay-sf-dst")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        let filePath = source.appendingPathComponent("bigfile.bin")
+        let data = Data(repeating: 0x5A, count: 500_000)
+        try data.write(to: filePath)
+
+        let manager = TransferManager()
+        let outcome = await manager.runRelaySingleFile(
+            source: localEndpoint(label: "Source", path: filePath),
+            staging: localEndpoint(label: "Staging", path: staging),
+            target: localEndpoint(label: "Target", path: target),
+            options: RsyncOptions()
+        )
+
+        XCTAssertEqual(outcome, .success)
+        let targetData = try Data(contentsOf: target.appendingPathComponent("bigfile.bin"))
+        XCTAssertEqual(targetData, data)
+    }
+
+    // MARK: - Dry run
+
+    func testDryRunDirectoryRelayPreviewsWithoutUploadingOrFailing() async throws {
+        let source = testDir.appendingPathComponent("relay-dry-src")
+        let staging = testDir.appendingPathComponent("relay-dry-staging")
+        let target = testDir.appendingPathComponent("relay-dry-dst")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        try Data("a".utf8).write(to: source.appendingPathComponent("item0"))
+        try Data("b".utf8).write(to: source.appendingPathComponent("item1"))
+
+        let options = RsyncOptions()
+        options.streamCount = 1
+        options.dryRun = true
+
+        let manager = TransferManager()
+        let outcome = await manager.runRelayDirectory(
+            source: localEndpoint(label: "Source", path: source),
+            staging: localEndpoint(label: "Staging", path: staging),
+            target: localEndpoint(label: "Target", path: target),
+            options: options
+        )
+
+        XCTAssertEqual(outcome, .success, "a dry run should preview cleanly, not fail because the upload leg has nothing staged to point at")
+        let targetContents = try FileManager.default.contentsOfDirectory(atPath: target.path)
+        XCTAssertTrue(targetContents.isEmpty, "dry run must not actually upload anything to the target")
+    }
+
+    func testDryRunDoesNotDeleteRealLeftoverStagedItemFromAnInterruptedRealRun() async throws {
+        let source = testDir.appendingPathComponent("relay-dry-leftover-src")
+        let staging = testDir.appendingPathComponent("relay-dry-leftover-staging")
+        let target = testDir.appendingPathComponent("relay-dry-leftover-dst")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        let payload = Data("real leftover data".utf8)
+        try payload.write(to: source.appendingPathComponent("leftover.bin"))
+        // Simulate a prior REAL relay that downloaded this item into staging
+        // but was interrupted before uploading/deleting it — exactly the
+        // resumable state the staging path is meant to preserve.
+        try payload.write(to: staging.appendingPathComponent("leftover.bin"))
+
+        let options = RsyncOptions()
+        options.streamCount = 1
+        options.dryRun = true
+
+        let manager = TransferManager()
+        let outcome = await manager.runRelayDirectory(
+            source: localEndpoint(label: "Source", path: source),
+            staging: localEndpoint(label: "Staging", path: staging),
+            target: localEndpoint(label: "Target", path: target),
+            options: options
+        )
+
+        XCTAssertEqual(outcome, .success)
+        let stagedData = try Data(contentsOf: staging.appendingPathComponent("leftover.bin"))
+        XCTAssertEqual(stagedData, payload, "a dry run must never delete real staged data left over from an interrupted real relay")
+    }
+
+    // MARK: - Resume skips already-relayed items
+
+    func testResumeSkipsItemsAlreadyRelayedInAnEarlierRunInsteadOfRedownloading() async throws {
+        let source = testDir.appendingPathComponent("relay-resume-src")
+        let staging = testDir.appendingPathComponent("relay-resume-staging")
+        let target = testDir.appendingPathComponent("relay-resume-dst")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        for i in 0..<2 {
+            try Data([UInt8(i)]).write(to: source.appendingPathComponent("item\(i)"))
+        }
+
+        let options = RsyncOptions()
+        options.streamCount = 1
+
+        let firstOutcome = await TransferManager().runRelayDirectory(
+            source: localEndpoint(label: "Source", path: source),
+            staging: localEndpoint(label: "Staging", path: staging),
+            target: localEndpoint(label: "Target", path: target),
+            options: options
+        )
+        XCTAssertEqual(firstOutcome, .success)
+
+        // A resumed run reuses the same staging path (it's deterministic
+        // per source/target pair) — every item is already marked relayed,
+        // so this should skip straight to done instead of re-downloading.
+        let secondManager = TransferManager()
+        let start = Date()
+        let secondOutcome = await secondManager.runRelayDirectory(
+            source: localEndpoint(label: "Source", path: source),
+            staging: localEndpoint(label: "Staging", path: staging),
+            target: localEndpoint(label: "Target", path: target),
+            options: options
+        )
+        let elapsed = Date().timeIntervalSince(start)
+
+        XCTAssertEqual(secondOutcome, .success)
+        XCTAssertLessThan(elapsed, 1.0, "skipping already-relayed items should be near-instant, not spawn rsync again for each one")
+        XCTAssertTrue(secondManager.state.logLines.contains { $0.contains("already relayed") })
+    }
+
     // MARK: - Remote-to-remote relay routing
 
     func testBothEndpointsRemoteRoutesThroughRelayAndFailsGracefullyWithoutServer() async throws {

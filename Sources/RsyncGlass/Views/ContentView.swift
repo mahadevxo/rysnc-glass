@@ -32,7 +32,7 @@ struct ContentView: View {
                         EndpointEditor(endpoint: target, serverStore: serverStore)
                     }
 
-                    OptionsPanel(options: options)
+                    OptionsPanel(options: options, isRemoteToRemote: source.kind == .remote && target.kind == .remote)
 
                     ProgressPanel(transferManager: transferManager) {
                         attemptStart()

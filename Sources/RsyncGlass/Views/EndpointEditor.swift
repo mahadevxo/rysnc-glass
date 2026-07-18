@@ -20,8 +20,23 @@ struct EndpointEditor: View {
     @State private var testResult: String?
     @State private var isTesting = false
     @State private var activeSheet: EndpointSheet?
+    // Set instead of activeSheet directly whenever a sheet is already showing:
+    // swapping .sheet(item:) straight from one non-nil value to another (with
+    // no nil in between) is unreliable on macOS — it can present blank
+    // instead of the new content. dismissing first (activeSheet = nil) and
+    // presenting the pending one from onDismiss avoids that.
+    @State private var pendingSheet: EndpointSheet?
     @State private var saveName = ""
     @State private var editingServer: SavedServer?
+
+    private func present(_ sheet: EndpointSheet) {
+        if activeSheet == nil {
+            activeSheet = sheet
+        } else {
+            pendingSheet = sheet
+            activeSheet = nil
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -45,7 +60,12 @@ struct EndpointEditor: View {
         }
         .frame(minWidth: 340)
         .glassPanel()
-        .sheet(item: $activeSheet) { sheet in
+        .sheet(item: $activeSheet, onDismiss: {
+            if let pendingSheet {
+                self.pendingSheet = nil
+                activeSheet = pendingSheet
+            }
+        }) { sheet in
             switch sheet {
             case .save:
                 saveServerSheet
@@ -61,9 +81,9 @@ struct EndpointEditor: View {
                         server: editingServer,
                         onSave: { updated in
                             serverStore.upsert(updated)
-                            activeSheet = .manage
+                            present(.manage)
                         },
-                        onCancel: { activeSheet = .manage }
+                        onCancel: { present(.manage) }
                     )
                 }
             }
@@ -121,7 +141,7 @@ struct EndpointEditor: View {
                             Spacer()
                             Button {
                                 editingServer = server
-                                activeSheet = .editServer
+                                present(.editServer)
                             } label: {
                                 Image(systemName: "pencil")
                             }
@@ -165,7 +185,7 @@ struct EndpointEditor: View {
                         }
                     }
                     Divider()
-                    Button("Manage Saved Servers…") { activeSheet = .manage }
+                    Button("Manage Saved Servers…") { present(.manage) }
                 } label: {
                     Label("Saved Servers", systemImage: "server.rack")
                         .font(.caption)
@@ -177,7 +197,7 @@ struct EndpointEditor: View {
 
                 Button {
                     saveName = endpoint.host
-                    activeSheet = .save
+                    present(.save)
                 } label: {
                     Label("Save", systemImage: "plus.circle")
                         .font(.caption)
@@ -207,7 +227,7 @@ struct EndpointEditor: View {
                     Text("Path").frame(width: 60, alignment: .leading).font(.caption)
                     TextField("/remote/path", text: $endpoint.remotePath)
                         .fieldStyle()
-                    Button("Browse…") { activeSheet = .browse }
+                    Button("Browse…") { present(.browse) }
                         .disabled(endpoint.host.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }

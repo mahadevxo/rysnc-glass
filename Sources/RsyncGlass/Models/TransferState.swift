@@ -17,6 +17,8 @@ final class StreamState: Identifiable {
     var isRunning: Bool = false
     var exitCode: Int32?
     var currentFile: String = ""
+    var itemsTotal: Int = 0          // remote-to-remote relay: total items assigned to this stream
+    var itemsCompleted: Int = 0      // remote-to-remote relay: items fully relayed (downloaded, uploaded, and deleted from staging)
 
     init(id: Int) {
         self.id = id
