@@ -8,7 +8,10 @@ struct ProcessResult {
 
 enum ProcessRunner {
     /// Runs a fully-configured Process to completion and captures its output.
-    static func run(_ process: Process) async throws -> ProcessResult {
+    /// - onStart: called with the process once it's running, so a caller can
+    ///   keep a handle on it and terminate it early. Indexing a large remote
+    ///   tree takes real time, and without this a cancel can't interrupt it.
+    static func run(_ process: Process, onStart: ((Process) -> Void)? = nil) async throws -> ProcessResult {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
@@ -27,6 +30,7 @@ enum ProcessRunner {
             }
             do {
                 try process.run()
+                onStart?(process)
             } catch {
                 continuation.resume(throwing: error)
             }

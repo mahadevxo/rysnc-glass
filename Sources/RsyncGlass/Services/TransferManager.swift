@@ -9,6 +9,16 @@ final class TransferManager {
     // .running once the job's Task actually starts running — guards against
     // a rapid double-click spawning two overlapping jobs in that gap.
     private var jobInFlight = false
+    // Bumped for every job start and every cancel. A job's Task carries the
+    // generation it began under and checks it before writing terminal state,
+    // so a cancelled job that's still unwinding in the background can't
+    // stomp on a job the user has already started since.
+    private var jobGeneration = 0
+    /// The running job's Task. Internal so a test can wait for a cancelled
+    /// job to finish tearing its processes down before inspecting disk state —
+    /// isTransferActive is released by cancel() immediately and so says
+    /// nothing about whether rsync has actually exited yet.
+    private(set) var jobTask: Task<Void, Never>?
 
     var isTransferActive: Bool { jobInFlight }
 
@@ -20,15 +30,27 @@ final class TransferManager {
 
     private func beginJob(source: Endpoint, target: Endpoint, options: RsyncOptions) {
         state.reset()
+        jobGeneration += 1
+        let generation = jobGeneration
         guard source.isValid, target.isValid else {
             state.statusMessage = "Fill in all required fields for both source and target."
             state.phase = .finished(success: false)
             jobInFlight = false
             return
         }
-        isCancelled = false
-        Task {
-            await runJob(source: source, target: target, options: options)
+        // Chain onto the previous job rather than running alongside it. After a
+        // cancel its Task may still be unwinding, and the two share isCancelled
+        // and runningProcesses — starting the new job on top of that would
+        // clear the flag the old one is still watching and let it resume. This
+        // also means isCancelled stays true for the old job's whole life, so it
+        // reliably stops instead of continuing into its next item.
+        let previous = jobTask
+        jobTask = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            guard generation == self.jobGeneration else { return }
+            self.isCancelled = false
+            await self.runJob(source: source, target: target, options: options, generation: generation)
         }
     }
 
@@ -41,6 +63,16 @@ final class TransferManager {
         for process in runningProcesses where process.isRunning {
             process.terminate()
         }
+        runningProcesses = []
+        // Release the start guard here rather than waiting for the job's Task
+        // to unwind. The UI offers Start again as soon as the phase flips, but
+        // the Task only gets there after its processes actually die, and until
+        // it called finalize() the guard in start() silently swallowed the
+        // next Start — Cancel followed by Start did nothing at all. Bumping
+        // the generation makes whatever that Task does when it finally lands
+        // a no-op, so releasing early is safe.
+        jobInFlight = false
+        jobGeneration += 1
         state.phase = .cancelled
         state.statusMessage = "Cancelled."
     }
@@ -51,28 +83,28 @@ final class TransferManager {
         case cancelled
     }
 
-    private func runJob(source: Endpoint, target: Endpoint, options: RsyncOptions) async {
+    private func runJob(source: Endpoint, target: Endpoint, options: RsyncOptions, generation: Int) async {
         state.phase = .planning
         state.statusMessage = "Checking dependencies…"
 
         if CommandLocator.rsync == nil {
-            fail("rsync not found on this Mac. Install it with: brew install rsync")
+            fail("rsync not found on this Mac. Install it with: brew install rsync", generation: generation)
             return
         }
         if (source.isRemote || target.isRemote) && CommandLocator.ssh == nil {
-            fail("ssh not found on this Mac.")
+            fail("ssh not found on this Mac.", generation: generation)
             return
         }
         if [source, target].contains(where: { $0.isRemote && $0.authMethod == .password }) && CommandLocator.sshpass == nil {
-            fail("Password auth needs sshpass. Install it with: brew install hudochenkov/sshpass/sshpass")
+            fail("Password auth needs sshpass. Install it with: brew install hudochenkov/sshpass/sshpass", generation: generation)
             return
         }
 
         if source.isRemote && target.isRemote {
-            await runRelay(source: source, target: target, options: options)
+            await runRelay(source: source, target: target, options: options, generation: generation)
         } else {
-            let outcome = await runLeg(source: source, target: target, options: options)
-            finalize(outcome: outcome)
+            let outcome = await runLeg(source: source, target: target, options: options, generation: generation)
+            finalize(outcome: outcome, generation: generation)
         }
     }
 
@@ -87,12 +119,12 @@ final class TransferManager {
     /// items already finished, so an interrupted relay resumes on the next
     /// run without re-downloading items that already landed on the target
     /// — a partially-downloaded item in progress still resumes via --partial.
-    private func runRelay(source: Endpoint, target: Endpoint, options: RsyncOptions) async {
+    private func runRelay(source: Endpoint, target: Endpoint, options: RsyncOptions, generation: Int) async {
         let stagingPath = RelayStaging.path(source: source, target: target)
         do {
             try FileManager.default.createDirectory(atPath: stagingPath, withIntermediateDirectories: true)
         } catch {
-            fail("Couldn't create a local staging folder for the remote-to-remote relay: \(error.localizedDescription)")
+            fail("Couldn't create a local staging folder for the remote-to-remote relay: \(error.localizedDescription)", generation: generation)
             return
         }
 
@@ -108,7 +140,7 @@ final class TransferManager {
         do {
             sourceIsDirectory = try await EndpointInspector.isDirectory(source)
         } catch {
-            fail("Couldn't inspect source path: \(error.localizedDescription)")
+            fail("Couldn't inspect source path: \(error.localizedDescription)", generation: generation)
             return
         }
 
@@ -126,7 +158,7 @@ final class TransferManager {
         if outcome == .success {
             try? FileManager.default.removeItem(atPath: stagingPath)
         }
-        finalize(outcome: outcome)
+        finalize(outcome: outcome, generation: generation)
     }
 
     /// Single-file relay: there's only one item, so there's nothing to bound
@@ -134,7 +166,7 @@ final class TransferManager {
     /// rsync itself needs a full local copy before it can push it onward.
     func runRelaySingleFile(source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions) async -> LegOutcome {
         let streamState = StreamState(id: 0)
-        streamState.byteShare = 1
+        streamState.workShare = 1
         streamState.itemsTotal = 1
         state.streams = [streamState]
         state.phase = .running
@@ -200,19 +232,23 @@ final class TransferManager {
     /// upload of item N with download of item N+1) depending on
     /// options.pipelineRelayLegs.
     func runRelayDirectory(source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions) async -> LegOutcome {
-        state.statusMessage = "Planning \(options.streamCount) parallel stream\(options.streamCount == 1 ? "" : "s")…"
-        let allItems: [SizedItem]
+        state.statusMessage = "Indexing source…"
+        let indexed: [SizedItem]
         do {
-            allItems = try await SizeLister.list(for: source)
+            indexed = try await SizeLister.list(for: source, onStart: registerProcess)
         } catch {
             let message = "Couldn't list source directory: \(error.localizedDescription)"
             state.appendLog(message)
             return .failure(message)
         }
-        guard !allItems.isEmpty else {
+        guard !indexed.isEmpty else {
             state.appendLog("Source directory is empty — nothing to relay.")
             return .success
         }
+        // Refine before consulting the manifest, so the names compared against
+        // it are the same shape as the ones a previous refined run recorded.
+        let allItems = await refineForBalance(items: indexed, in: source, options: options)
+        state.statusMessage = "Planning \(options.streamCount) parallel stream\(options.streamCount == 1 ? "" : "s")…"
 
         // Items already fully relayed in an earlier run are deleted from
         // staging as they complete (that's how this stays disk-bounded), so
@@ -220,7 +256,7 @@ final class TransferManager {
         // comparison. A small on-disk manifest fills that gap so a resumed
         // run doesn't re-download items that already landed on the target.
         let alreadyRelayed = loadRelayedItems(staging: staging)
-        let items = allItems.filter { !alreadyRelayed.contains($0.name) }
+        let items = allItems.filter { !isRelayed($0.name, in: alreadyRelayed) }
         guard !items.isEmpty else {
             state.appendLog("Every item was already relayed in an earlier run — nothing left to do.")
             return .success
@@ -229,15 +265,20 @@ final class TransferManager {
             state.appendLog("Skipping \(allItems.count - items.count) item(s) already relayed in an earlier run.")
         }
 
+        // Same window as runLeg: a cancel kills the scan, so an empty result
+        // here means "cancelled", not "nothing to do". Check before we set a
+        // running phase the cancelled job would then be stuck in.
+        if isCancelled { return .cancelled }
+
         let plans = SplitPlanner.plan(items: items, streamCount: options.streamCount)
-        let grandTotal = max(plans.reduce(0) { $0 + $1.totalKB }, 1)
+        let grandTotal = max(plans.reduce(0) { $0 + $1.cost }, 1)
 
         var groups: [(streamState: StreamState, itemNames: [String])] = []
         for (index, plan) in plans.enumerated() {
             let streamState = StreamState(id: index)
             streamState.itemNames = plan.itemNames
             streamState.itemsTotal = plan.itemNames.count
-            streamState.byteShare = Double(plan.totalKB) / Double(grandTotal)
+            streamState.workShare = Double(plan.cost) / Double(grandTotal)
             groups.append((streamState, plan.itemNames))
         }
 
@@ -261,6 +302,9 @@ final class TransferManager {
             for await result in group { collected.append(result) }
             return collected
         }
+
+        // Every stream is done, so nothing is writing to staging any more.
+        pruneEmptyDirectories(in: staging)
 
         if isCancelled { return .cancelled }
         return results.allSatisfy { $0 } ? .success : .failure(nil)
@@ -337,13 +381,51 @@ final class TransferManager {
             return false
         }
         await MainActor.run { runningProcesses.append(process) }
-        let exitCode = await runProcessCapturingOutput(process, streamID: streamState.id)
+        let exitCode = await runProcessCapturingOutput(process, streamState: streamState)
         await MainActor.run { runningProcesses.removeAll { $0 === process } }
         return exitCode == 0
     }
 
+    /// True if this item, or a directory containing it, was already relayed.
+    /// The ancestor check matters when an earlier run recorded a whole folder
+    /// and this run split that same folder into subfolders — without it, a
+    /// resume would re-transfer everything under it.
+    ///
+    /// The reverse isn't covered: how finely a run splits depends on its
+    /// stream count, so lowering the stream count between runs can leave this
+    /// run asking about "photos" when the manifest only holds "photos/2019"
+    /// and its siblings. That resume re-relays the folder — rsync still skips
+    /// the files already on the target, so it costs a rescan, not a recopy.
+    private func isRelayed(_ name: String, in relayed: Set<String>) -> Bool {
+        if relayed.contains(name) { return true }
+        var prefix = ""
+        for component in name.split(separator: "/").dropLast() {
+            prefix = prefix.isEmpty ? String(component) : prefix + "/" + component
+            if relayed.contains(prefix) { return true }
+        }
+        return false
+    }
+
     private func deleteLocalItem(name: String, staging: Endpoint) {
         try? FileManager.default.removeItem(atPath: PathUtilities.join(staging.localPath, name))
+    }
+
+    /// Clears out the empty parent directories nested items leave behind
+    /// ("photos/" once every "photos/<year>" has been relayed). Deliberately
+    /// not done as each item completes: sibling items of the same parent run
+    /// on different streams, and deleting a directory that merely looks empty
+    /// could take out one a sibling's rsync had just created and was about to
+    /// write into. Empty directories cost no disk, so this waits until every
+    /// stream has finished and nothing else is writing.
+    private func pruneEmptyDirectories(in staging: Endpoint) {
+        let root = staging.localPath
+        let all = (FileManager.default.enumerator(atPath: root)?.allObjects as? [String]) ?? []
+        // Deepest first, so emptying a child lets its parent go too.
+        for relative in all.sorted(by: { $0.components(separatedBy: "/").count > $1.components(separatedBy: "/").count }) {
+            // rmdir removes a directory only if it's empty, as one atomic
+            // operation — unlike removeItem, which deletes recursively.
+            _ = rmdir(PathUtilities.join(root, relative))
+        }
     }
 
     private static let relayedItemsFileName = ".rsyncglass-relayed-items"
@@ -387,47 +469,65 @@ final class TransferManager {
     /// Runs one source→target rsync leg (splitting into parallel streams if
     /// requested) and reports how it ended. Does not set a terminal phase —
     /// callers decide that, since a relay has a second leg to run after this one.
-    private func runLeg(source: Endpoint, target: Endpoint, options: RsyncOptions) async -> LegOutcome {
+    private func runLeg(source: Endpoint, target: Endpoint, options: RsyncOptions, generation: Int) async -> LegOutcome {
         state.statusMessage = "Inspecting source…"
         let sourceIsDirectory: Bool
         do {
             sourceIsDirectory = try await EndpointInspector.isDirectory(source)
         } catch {
-            fail("Couldn't inspect source path: \(error.localizedDescription)")
+            fail("Couldn't inspect source path: \(error.localizedDescription)", generation: generation)
             return .failure(nil)
         }
 
         var plans: [StreamPlan] = []
         if options.streamCount > 1 && sourceIsDirectory {
-            state.statusMessage = "Planning \(options.streamCount) parallel streams…"
+            state.statusMessage = "Indexing source…"
             do {
-                let items = try await SizeLister.list(for: source)
+                // Registered so Cancel can terminate the scan: indexing walks
+                // the whole tree, which on a large remote source is long
+                // enough that an uninterruptible one would leave Cancel
+                // looking like it did nothing.
+                let items = try await SizeLister.list(for: source, onStart: registerProcess)
                 if items.isEmpty {
                     state.appendLog("Source directory has nothing to split — running as a single stream.")
                 } else {
-                    plans = SplitPlanner.plan(items: items, streamCount: options.streamCount)
+                    let totalEntries = items.reduce(0) { $0 + $1.entryCount }
+                    let totalKB = items.reduce(0) { $0 + $1.sizeKB }
+                    state.appendLog("Indexed \(items.count) top-level item(s): \(Self.formatKB(totalKB)) across \(totalEntries) entries.")
+                    let refined = await refineForBalance(items: items, in: source, options: options)
+                    state.statusMessage = "Planning \(options.streamCount) parallel streams…"
+                    plans = SplitPlanner.plan(items: refined, streamCount: options.streamCount)
+                    for (index, plan) in plans.enumerated() {
+                        state.appendLog("Stream \(index + 1): \(plan.itemNames.count) item(s), \(Self.formatKB(plan.totalKB)).")
+                    }
                 }
             } catch {
                 state.appendLog("Couldn't split source for parallel streams (\(error.localizedDescription)) — falling back to a single stream.")
             }
         }
 
+        // Cancelling kills the scan, which makes it come back empty — exactly
+        // what an unsplittable source looks like. Without this check the job
+        // would "fall back to a single stream" and transfer the whole source
+        // the user just cancelled.
+        if isCancelled { return .cancelled }
+
         var jobs: [(process: Process, streamState: StreamState)] = []
         do {
             if plans.isEmpty {
                 let streamState = StreamState(id: 0)
-                streamState.byteShare = 1
+                streamState.workShare = 1
                 let process = try RsyncCommandBuilder.buildProcess(
                     source: source, target: target, itemNames: nil,
                     sourceIsDirectory: sourceIsDirectory, options: options
                 )
                 jobs.append((process, streamState))
             } else {
-                let grandTotal = max(plans.reduce(0) { $0 + $1.totalKB }, 1)
+                let grandTotal = max(plans.reduce(0) { $0 + $1.cost }, 1)
                 for (index, plan) in plans.enumerated() {
                     let streamState = StreamState(id: index)
                     streamState.itemNames = plan.itemNames
-                    streamState.byteShare = Double(plan.totalKB) / Double(grandTotal)
+                    streamState.workShare = Double(plan.cost) / Double(grandTotal)
                     let process = try RsyncCommandBuilder.buildProcess(
                         source: source, target: target, itemNames: plan.itemNames,
                         sourceIsDirectory: sourceIsDirectory, options: options
@@ -436,7 +536,7 @@ final class TransferManager {
                 }
             }
         } catch {
-            fail("Couldn't build rsync command: \(error.localizedDescription)")
+            fail("Couldn't build rsync command: \(error.localizedDescription)", generation: generation)
             return .failure(nil)
         }
 
@@ -460,7 +560,11 @@ final class TransferManager {
         return state.streams.allSatisfy { $0.exitCode == 0 } ? .success : .failure(nil)
     }
 
-    private func finalize(outcome: LegOutcome) {
+    /// Applies a job's terminal state, unless the user has cancelled or
+    /// started another job since — a stale job's outcome must not overwrite
+    /// the current one's phase or re-enable a guard the new job owns.
+    private func finalize(outcome: LegOutcome, generation: Int) {
+        guard generation == jobGeneration else { return }
         runningProcesses = []
         jobInFlight = false
         switch outcome {
@@ -476,7 +580,8 @@ final class TransferManager {
         }
     }
 
-    private func fail(_ message: String) {
+    private func fail(_ message: String, generation: Int) {
+        guard generation == jobGeneration else { return }
         state.statusMessage = message
         state.appendLog(message)
         state.phase = .finished(success: false)
@@ -485,7 +590,7 @@ final class TransferManager {
 
     private func runStream(process: Process, streamState: StreamState) async {
         await MainActor.run { streamState.isRunning = true }
-        let exitCode = await runProcessCapturingOutput(process, streamID: streamState.id)
+        let exitCode = await runProcessCapturingOutput(process, streamState: streamState)
         await MainActor.run {
             streamState.isRunning = false
             streamState.exitCode = exitCode
@@ -496,10 +601,12 @@ final class TransferManager {
     }
 
     /// Runs a process to completion, piping its stdout/stderr into the shared
-    /// log (tagged with streamID) and returning its exit code directly rather
-    /// than through shared mutable state — safe to call concurrently for the
-    /// same streamID (e.g. a pipelined relay's overlapping download/upload).
-    private func runProcessCapturingOutput(_ process: Process, streamID: Int) async -> Int32 {
+    /// log (tagged with the stream's number) and returning its exit code
+    /// directly rather than through shared mutable state — safe to call
+    /// concurrently for the same stream (e.g. a pipelined relay's
+    /// overlapping download/upload).
+    private func runProcessCapturingOutput(_ process: Process, streamState: StreamState) async -> Int32 {
+        let streamID = streamState.id
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
@@ -508,7 +615,7 @@ final class TransferManager {
         let onLine: (String) -> Void = { [weak self] line in
             guard let self else { return }
             Task { @MainActor in
-                self.handleOutputLine(line, streamID: streamID)
+                self.handleOutputLine(line, for: streamState)
             }
         }
 
@@ -551,11 +658,15 @@ final class TransferManager {
     }
 
     @MainActor
-    private func handleOutputLine(_ line: String, streamID: Int) {
+    private func handleOutputLine(_ line: String, for streamState: StreamState) {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
-        state.appendLog("[Stream \(streamID + 1)] \(trimmed)")
-        guard let streamState = state.streams.first(where: { $0.id == streamID }) else { return }
+        // A cancelled job's processes keep draining output while they wind
+        // down. Once its streams have been replaced, they're no longer part of
+        // the displayed state, so drop their output rather than logging it
+        // against — or worse, writing progress into — whatever runs now.
+        guard state.streams.contains(where: { $0 === streamState }) else { return }
+        state.appendLog("[Stream \(streamState.id + 1)] \(trimmed)")
 
         // Streams relaying more than one item (itemsTotal > 1) track progress
         // by item count instead — each item's process restarts near 0%, so
@@ -573,6 +684,47 @@ final class TransferManager {
         } else if !trimmed.contains("%") && !trimmed.hasPrefix("⚠︎") {
             streamState.currentFile = trimmed
         }
+    }
+
+    /// Registers a planning-phase process so Cancel can terminate it — those
+    /// scans walk the whole tree and would otherwise ignore a cancel.
+    private func registerProcess(_ process: Process) {
+        Task { @MainActor in
+            // Registering happens after the process is already running, so a
+            // cancel can land in between. Terminating it here rather than
+            // adding it to a list nobody will revisit stops a scan that would
+            // otherwise keep walking a large tree unsupervised.
+            guard !self.isCancelled else {
+                process.terminate()
+                return
+            }
+            // Left in the list once finished rather than cleared via
+            // terminationHandler — ProcessRunner owns that handler to resume
+            // its continuation, and overwriting it would hang the scan.
+            // cancel() skips processes that aren't running, and the list is
+            // replaced wholesale once the transfer starts, so the few
+            // finished scans sitting in it are harmless.
+            self.runningProcesses.append(process)
+        }
+    }
+
+    /// Breaks up any item too big for one stream, reporting what it did.
+    /// Falls back silently to the unrefined items if the extra scan fails —
+    /// a worse split is much better than a failed transfer.
+    private func refineForBalance(items: [SizedItem], in source: Endpoint, options: RsyncOptions) async -> [SizedItem] {
+        let refined = await SplitPlanner.refine(items: items, streamCount: options.streamCount) { [weak self] parents in
+            guard let self else { return [] }
+            await MainActor.run { self.state.statusMessage = "Indexing inside \(parents.count) large item(s)…" }
+            return await SizeLister.listChildren(of: parents, in: source, onStart: self.registerProcess)
+        }
+        if refined.count != items.count {
+            state.appendLog("Split \(items.count) top-level item(s) into \(refined.count) for balance — a directory too big for one stream is transferred as several of its subfolders.")
+        }
+        return refined
+    }
+
+    private static func formatKB(_ kb: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(kb) * 1024, countStyle: .file)
     }
 
     private static func parsePercent(_ line: String) -> Int? {

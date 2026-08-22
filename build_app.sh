@@ -37,8 +37,16 @@ echo "Using Xcode at $DEVELOPER_DIR"
 echo "Building release binary…"
 swift build -c release
 
-APP="RsyncGlass.app"
-rm -rf "$APP"
+FINAL_APP="RsyncGlass.app"
+# Assemble and sign in a scratch directory rather than in place. If the
+# project lives somewhere Finder, Spotlight or an iCloud file provider is
+# watching (a synced Desktop folder, say), the bundle gets tagged with a
+# com.apple.FinderInfo xattr faster than we can strip it, and codesign
+# rejects the bundle outright ("resource fork ... detritus not allowed").
+# Nothing is watching a temp directory, so signing there is reliable.
+BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+APP="$BUILD_DIR/RsyncGlass.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin" "$APP/Contents/Resources/lib"
 
 cp .build/release/RsyncGlass "$APP/Contents/MacOS/RsyncGlass"
@@ -109,24 +117,14 @@ bundle_binary rsync
 bundle_binary sshpass
 
 echo "Codesigning (ad-hoc)…"
-# Finder/Spotlight can tag freshly written files with a com.apple.FinderInfo
-# xattr fast enough that codesign then rejects the bundle outright
-# ("resource fork ... detritus not allowed"). Clearing first is cheaper than
-# racing it.
-xattr -cr "$APP" 2>/dev/null || true
 # Sign bundled binaries and dylibs individually first: they sit under
 # Resources, not one of the standard Frameworks/PlugIns spots --deep walks,
 # and install_name_tool invalidates whatever signature they arrived with.
 for f in "$APP/Contents/Resources/bin/"* "$APP/Contents/Resources/lib/"*; do
     [[ -f "$f" ]] && codesign --force --sign - "$f"
 done
-# Finder can re-tag the bundle while the steps above run, so clear again
-# immediately before the sign that would trip over it, and retry once.
-xattr -cr "$APP" 2>/dev/null || true
-if ! codesign --force --deep --sign - "$APP" 2>/dev/null; then
-    xattr -cr "$APP" 2>/dev/null || true
-    codesign --force --deep --sign - "$APP"
-fi
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP"
 
 # A bundled rsync that can't launch is the failure this whole section exists
 # to prevent, and it's invisible until someone runs the app on a clean Mac.
@@ -143,4 +141,11 @@ for f in "$APP/Contents/Resources/bin/"*; do
     echo "Verified bundled $(basename "$f") launches"
 done
 
-echo "Built $APP"
+# Move the finished bundle into place. ditto preserves the signature; a
+# file provider may re-tag the copy with FinderInfo afterwards, which makes
+# `codesign --verify` complain at rest, but the signature itself is intact
+# (verified above) and the app runs. `xattr -cr RsyncGlass.app` silences it.
+rm -rf "$FINAL_APP"
+ditto "$APP" "$FINAL_APP"
+
+echo "Built $FINAL_APP"

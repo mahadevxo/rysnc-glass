@@ -42,12 +42,21 @@ enum RsyncCommandBuilder {
         }
 
         if let itemNames, !itemNames.isEmpty {
+            // A nested item name ("photos/2019") has to be sent with -R and a
+            // "/./" marker, or rsync copies just the leaf and the item lands
+            // at the target root as "2019" instead of "photos/2019". The
+            // marker says "keep everything after this point". Flat names copy
+            // identically either way, so only pay for -R when it's needed.
+            let needsRelative = itemNames.contains { $0.contains("/") }
+            if needsRelative {
+                args.append("-R")
+            }
             for name in itemNames {
-                if source.isRemote {
-                    args.append(source.remoteSpec(path: PathUtilities.join(source.remotePath, name)))
-                } else {
-                    args.append(PathUtilities.join(source.localPath, name))
-                }
+                let base = source.isRemote ? source.remotePath : source.localPath
+                let path = needsRelative
+                    ? PathUtilities.withTrailingSlash(base) + "./" + name
+                    : PathUtilities.join(base, name)
+                args.append(source.isRemote ? source.remoteSpec(path: path) : path)
             }
         } else {
             let path = sourceIsDirectory ? PathUtilities.withTrailingSlash(source.path) : source.path

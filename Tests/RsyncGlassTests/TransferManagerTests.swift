@@ -30,15 +30,28 @@ final class TransferManagerTests: XCTestCase {
         }
     }
 
-    /// Unlike state.phase (which cancel() flips synchronously), isTransferActive
-    /// only clears once the job's background task has actually finished
-    /// tearing down its processes — the right thing to wait on before
-    /// inspecting on-disk state right after a cancel.
-    private func waitUntilInactive(_ manager: TransferManager, timeout: TimeInterval = 30) async {
+    /// cancel() flips state.phase and releases isTransferActive synchronously,
+    /// but the rsync processes it signalled exit asynchronously afterward.
+    /// Awaiting the job's own Task is what actually waits for that teardown —
+    /// the right thing to do before inspecting on-disk state after a cancel.
+    private func waitForJobToUnwind(_ manager: TransferManager) async {
+        await manager.jobTask?.value
+    }
+
+    /// Waits until rsync has written at least some bytes into `directory`.
+    /// While a transfer is in flight the data sits in a hidden temp file
+    /// (`.big.bin.XXXXXX`); `--partial` renames it into place on interruption.
+    private func waitForBytesInFlight(in directory: URL, timeout: TimeInterval = 20) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
-        while manager.isTransferActive, Date() < deadline {
+        while Date() < deadline {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+            for name in names {
+                let attrs = try? FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent(name).path)
+                if let size = attrs?[.size] as? Int, size > 0 { return true }
+            }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
+        return false
     }
 
     private func localEndpoint(label: String, path: URL) -> Endpoint {
@@ -108,7 +121,7 @@ final class TransferManagerTests: XCTestCase {
         XCTAssertEqual(Set(allItemNames), Set(items.map { $0.name }))
         XCTAssertEqual(allItemNames.count, items.count)
 
-        let shares = manager.state.streams.map { $0.byteShare }
+        let shares = manager.state.streams.map { $0.workShare }
         XCTAssertEqual(shares.reduce(0, +), 1, accuracy: 0.01, "byte shares across streams should sum to ~1")
     }
 
@@ -128,7 +141,7 @@ final class TransferManagerTests: XCTestCase {
         await waitForTerminal(manager)
 
         XCTAssertEqual(manager.state.streams.count, 1)
-        XCTAssertEqual(manager.state.streams.first?.byteShare, 1)
+        XCTAssertEqual(manager.state.streams.first?.workShare, 1)
         XCTAssertEqual((try? Data(contentsOf: target.appendingPathComponent("f1.txt"))), Data("a".utf8))
         XCTAssertEqual((try? Data(contentsOf: target.appendingPathComponent("f2.txt"))), Data("b".utf8))
     }
@@ -157,13 +170,18 @@ final class TransferManagerTests: XCTestCase {
         let targetEndpoint = localEndpoint(label: "Target", path: target)
 
         manager.start(source: sourceEndpoint, target: targetEndpoint, options: options)
-        try await Task.sleep(nanoseconds: 2_000_000_000) // let ~4MB transfer
+        // Wait for rsync to actually be writing rather than sleeping a fixed
+        // interval: on a loaded machine its startup and file-list phase can
+        // eat the whole budget, and cancelling before a single byte lands
+        // leaves no partial file and fails a test that isn't really broken.
+        let started = await waitForBytesInFlight(in: target)
+        XCTAssertTrue(started, "rsync never began writing to the target — can't test resume without a partial file")
         manager.cancel()
         // cancel() flips state.phase to .cancelled synchronously, but the
         // underlying rsync process's actual SIGTERM/exit/flush happens
-        // asynchronously afterward — wait for that to truly finish (tracked
-        // by isTransferActive) before inspecting the partial file on disk.
-        await waitUntilInactive(manager, timeout: 5)
+        // asynchronously afterward — wait for the job's task to finish
+        // before inspecting the partial file on disk.
+        await waitForJobToUnwind(manager)
 
         guard case .cancelled = manager.state.phase else {
             XCTFail("expected cancelled phase, got \(manager.state.phase)")
@@ -211,6 +229,219 @@ final class TransferManagerTests: XCTestCase {
         await waitForTerminal(manager)
 
         XCTAssertEqual(manager.state.streams.count, 1, "a rapid double Start shouldn't spawn a second overlapping job")
+    }
+
+    /// The re-entrancy guard used to outlive the cancel that should have
+    /// released it: cancel() flipped the phase (so the UI offered Start again)
+    /// but left jobInFlight set until the background task finished unwinding,
+    /// and start() silently returned in the meantime. Clicking Start right
+    /// after Cancel did nothing at all.
+    func testCancellingThenImmediatelyStartingADifferentTransferRunsIt() async throws {
+        let source = testDir.appendingPathComponent("csrc")
+        let otherSource = testDir.appendingPathComponent("osrc")
+        let target = testDir.appendingPathComponent("cdst")
+        for dir in [source, otherSource, target] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        // Big enough, and throttled enough, to still be running when cancelled.
+        try Data(repeating: 0x5A, count: 20_000_000).write(to: source.appendingPathComponent("big.bin"))
+        try Data("second transfer".utf8).write(to: otherSource.appendingPathComponent("other.txt"))
+
+        let options = RsyncOptions()
+        options.streamCount = 1
+        options.compress = false
+        options.bandwidthLimitKBps = "2000"
+
+        let manager = TransferManager()
+        manager.start(source: localEndpoint(label: "Source", path: source),
+                      target: localEndpoint(label: "Target", path: target),
+                      options: options)
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        XCTAssertTrue(manager.isTransferActive, "should still be transferring before we cancel")
+
+        manager.cancel()
+        // Deliberately no wait here — this is the exact race the bug lived in.
+        let secondOptions = RsyncOptions()
+        secondOptions.streamCount = 1
+        manager.start(source: localEndpoint(label: "Source", path: otherSource),
+                      target: localEndpoint(label: "Target", path: target),
+                      options: secondOptions)
+
+        await waitForTerminal(manager, timeout: 30)
+
+        guard case .finished(let success) = manager.state.phase else {
+            XCTFail("second transfer should have run and finished, but phase is \(manager.state.phase)")
+            return
+        }
+        XCTAssertTrue(success, "second transfer should have succeeded")
+
+        let delivered = try Data(contentsOf: target.appendingPathComponent("other.txt"))
+        XCTAssertEqual(delivered, Data("second transfer".utf8),
+                       "the transfer started right after cancel should actually have moved its file")
+    }
+
+    /// A cancelled job that's still winding down must not report its own
+    /// outcome over the top of the job the user started next.
+    func testCancelledJobDoesNotOverwriteTheNextJobsResult() async throws {
+        let source = testDir.appendingPathComponent("wsrc")
+        let target = testDir.appendingPathComponent("wdst")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data(repeating: 0x5A, count: 20_000_000).write(to: source.appendingPathComponent("big.bin"))
+
+        let options = RsyncOptions()
+        options.streamCount = 1
+        options.compress = false
+        options.bandwidthLimitKBps = "2000"
+
+        let manager = TransferManager()
+        let sourceEndpoint = localEndpoint(label: "Source", path: source)
+        let targetEndpoint = localEndpoint(label: "Target", path: target)
+
+        manager.start(source: sourceEndpoint, target: targetEndpoint, options: options)
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        manager.cancel()
+
+        // Nothing else started — the cancelled job unwinding on its own must
+        // leave the phase cancelled, not flip it to finished.
+        await waitForJobToUnwind(manager)
+        XCTAssertEqual(manager.state.phase, .cancelled,
+                       "a cancelled job's own teardown shouldn't report a terminal success/failure")
+        XCTAssertFalse(manager.isTransferActive, "cancel should release the start guard")
+    }
+
+    /// Cancelling during the indexing scan has to actually stop the job.
+    /// Killing the scan makes it return nothing, which looks exactly like
+    /// "this source can't be split" — so without an explicit check the job
+    /// falls back to a single stream and transfers everything the user just
+    /// cancelled, with the phase left stuck mid-flight.
+    func testCancellingDuringIndexingDoesNotStartTheTransferAnyway() async throws {
+        let source = testDir.appendingPathComponent("isrc")
+        let target = testDir.appendingPathComponent("idst")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        // Enough entries that walking them takes long enough to cancel inside.
+        for group in 0..<40 {
+            let dir = source.appendingPathComponent("g\(group)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for i in 0..<250 {
+                try Data("x".utf8).write(to: dir.appendingPathComponent("f\(i)"))
+            }
+        }
+
+        let options = RsyncOptions()
+        options.streamCount = 4
+
+        let manager = TransferManager()
+        manager.start(source: localEndpoint(label: "Source", path: source),
+                      target: localEndpoint(label: "Target", path: target),
+                      options: options)
+
+        // Cancel as soon as the scan is under way.
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline, !manager.state.statusMessage.contains("Indexing") {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        manager.cancel()
+        await waitForJobToUnwind(manager)
+
+        XCTAssertEqual(manager.state.phase, .cancelled,
+                       "cancelling during indexing should leave the job cancelled, not running or finished")
+
+        let delivered = (try? FileManager.default.contentsOfDirectory(atPath: target.path)) ?? []
+        XCTAssertTrue(delivered.isEmpty,
+                      "nothing should have been transferred after cancelling during indexing, got \(delivered.count) item(s)")
+    }
+
+    // MARK: - Deep splitting (rsync -R)
+
+    /// A source dominated by one directory used to be a single stream no
+    /// matter how many were requested, because balancing can only move whole
+    /// top-level items. Splitting inside it needs rsync -R, and the risk of
+    /// -R is layout: the subfolders have to land nested under their parent,
+    /// not flattened into the target root.
+    func testDominantDirectoryIsSplitAcrossStreamsAndStillLandsNested() async throws {
+        let source = testDir.appendingPathComponent("dsrc")
+        let target = testDir.appendingPathComponent("ddst")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        // One dominant folder of four sizeable subfolders, plus a scrap file.
+        let photos = source.appendingPathComponent("photos")
+        for year in ["2019", "2020", "2021", "2022"] {
+            let dir = photos.appendingPathComponent(year)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for i in 0..<5 {
+                try Data(repeating: UInt8(i), count: 400_000).write(to: dir.appendingPathComponent("p\(i).jpg"))
+            }
+        }
+        try Data("note".utf8).write(to: source.appendingPathComponent("note.txt"))
+
+        let options = RsyncOptions()
+        options.streamCount = 4
+
+        let manager = TransferManager()
+        manager.start(source: localEndpoint(label: "Source", path: source),
+                      target: localEndpoint(label: "Target", path: target),
+                      options: options)
+        await waitForTerminal(manager, timeout: 60)
+
+        guard case .finished(let success) = manager.state.phase else {
+            XCTFail("expected finished phase, got \(manager.state.phase)")
+            return
+        }
+        XCTAssertTrue(success, "transfer should succeed")
+
+        XCTAssertGreaterThan(manager.state.streams.count, 1,
+                             "a source dominated by one directory should still use multiple streams")
+
+        // The whole point of -R: nested layout preserved, nothing flattened.
+        for year in ["2019", "2020", "2021", "2022"] {
+            for i in 0..<5 {
+                let landed = target.appendingPathComponent("photos/\(year)/p\(i).jpg")
+                XCTAssertTrue(FileManager.default.fileExists(atPath: landed.path),
+                              "photos/\(year)/p\(i).jpg should land nested under photos/")
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: target.appendingPathComponent(year).path),
+                           "\(year) must not be flattened into the target root")
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.appendingPathComponent("note.txt").path))
+    }
+
+    /// Deep splitting must not change what a transfer produces — same bytes,
+    /// same tree, whether or not the source got split inside a directory.
+    func testDeepSplitTransferMatchesSourceExactly() async throws {
+        let source = testDir.appendingPathComponent("esrc")
+        let target = testDir.appendingPathComponent("edst")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        let big = source.appendingPathComponent("big")
+        for sub in ["a", "b", "c"] {
+            let dir = big.appendingPathComponent(sub).appendingPathComponent("inner")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for i in 0..<4 {
+                try Data(repeating: UInt8(i &+ 1), count: 300_000).write(to: dir.appendingPathComponent("f\(i).bin"))
+            }
+        }
+
+        let options = RsyncOptions()
+        options.streamCount = 3
+
+        let manager = TransferManager()
+        manager.start(source: localEndpoint(label: "Source", path: source),
+                      target: localEndpoint(label: "Target", path: target),
+                      options: options)
+        await waitForTerminal(manager, timeout: 60)
+
+        for sub in ["a", "b", "c"] {
+            for i in 0..<4 {
+                let rel = "big/\(sub)/inner/f\(i).bin"
+                let src = try Data(contentsOf: source.appendingPathComponent(rel))
+                let dst = try Data(contentsOf: target.appendingPathComponent(rel))
+                XCTAssertEqual(src, dst, "\(rel) should be byte-identical")
+            }
+        }
     }
 
     // MARK: - Clear log
@@ -290,6 +521,76 @@ final class TransferManagerTests: XCTestCase {
             let actual = try Data(contentsOf: target.appendingPathComponent("item\(i)"))
             XCTAssertEqual(actual, expected, "item\(i) should be byte-identical after relay")
         }
+    }
+
+    /// The relay splits inside a dominant directory too, which means its
+    /// items are nested paths. Two things have to survive that: the target
+    /// layout (rsync -R on both legs, not flattened), and disk-bounding —
+    /// each subfolder must still be deleted from staging as it completes,
+    /// including the parent directory it left behind.
+    func testRelaySplitsInsideADominantDirectoryAndStaysDiskBounded() async throws {
+        let source = testDir.appendingPathComponent("relay-deep-src")
+        let staging = testDir.appendingPathComponent("relay-deep-staging")
+        let target = testDir.appendingPathComponent("relay-deep-dst")
+        for dir in [staging, target] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        let years = ["2018", "2019", "2020", "2021", "2022", "2023"]
+        for (index, year) in years.enumerated() {
+            let dir = source.appendingPathComponent("photos").appendingPathComponent(year)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Data(repeating: UInt8(index + 1), count: 1_500_000).write(to: dir.appendingPathComponent("p.jpg"))
+        }
+
+        let streamCount = 3
+        let options = RsyncOptions()
+        options.streamCount = streamCount
+        options.compress = false
+        options.bandwidthLimitKBps = "1500" // ~1s per leg, so polling can see staging mid-flight
+
+        let manager = TransferManager()
+        var maxObservedStagedPayload = 0
+        let pollTask = Task {
+            while !Task.isCancelled {
+                // Count actual payload files anywhere under staging, ignoring
+                // the manifest — nested items mean depth, not just top level.
+                let all = FileManager.default.enumerator(atPath: staging.path)?.allObjects as? [String] ?? []
+                let payload = all.filter { $0.hasSuffix("p.jpg") }
+                maxObservedStagedPayload = max(maxObservedStagedPayload, payload.count)
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+
+        let outcome = await manager.runRelayDirectory(
+            source: localEndpoint(label: "Source", path: source),
+            staging: localEndpoint(label: "Staging", path: staging),
+            target: localEndpoint(label: "Target", path: target),
+            options: options
+        )
+        pollTask.cancel()
+
+        XCTAssertEqual(outcome, .success)
+
+        // Nested layout preserved on the target, nothing flattened.
+        for (index, year) in years.enumerated() {
+            let landed = target.appendingPathComponent("photos/\(year)/p.jpg")
+            XCTAssertEqual(try? Data(contentsOf: landed), Data(repeating: UInt8(index + 1), count: 1_500_000),
+                           "photos/\(year)/p.jpg should relay through nested and byte-identical")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: target.appendingPathComponent("\(year)/p.jpg").path),
+                           "\(year) must not be flattened into the target root")
+        }
+
+        // Disk-bounding is per stream: each holds one item at a time, so with
+        // 6 items over 3 streams staging never holds more than 3 — not all 6.
+        XCTAssertLessThanOrEqual(maxObservedStagedPayload, streamCount,
+                                 "relay should hold at most one item per stream in staging, even when items are nested")
+        XCTAssertGreaterThan(maxObservedStagedPayload, 0, "polling should have caught staging mid-flight at least once")
+
+        let leftovers = (FileManager.default.enumerator(atPath: staging.path)?.allObjects as? [String] ?? [])
+            .filter { $0 != ".rsyncglass-relayed-items" }
+        XCTAssertTrue(leftovers.isEmpty,
+                      "staging should be empty afterwards — including the parent dirs nested items leave behind, got \(leftovers)")
     }
 
     func testDirectoryRelayPipelinedOverlapsButStaysDiskBoundedAndCorrect() async throws {

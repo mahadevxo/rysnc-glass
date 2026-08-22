@@ -12,7 +12,7 @@ enum JobPhase: Equatable {
 final class StreamState: Identifiable {
     let id: Int
     var itemNames: [String] = []
-    var byteShare: Double = 0        // fraction of total bytes this stream is responsible for (0...1)
+    var workShare: Double = 0        // fraction of total estimated work this stream is responsible for (0...1), see SplitPlanner.cost
     var progressFraction: Double = 0 // 0...1, parsed from rsync --info=progress2 output
     var isRunning: Bool = false
     var exitCode: Int32?
@@ -34,7 +34,7 @@ final class TransferState {
 
     var overallProgress: Double {
         guard !streams.isEmpty else { return 0 }
-        return streams.reduce(0.0) { $0 + $1.progressFraction * $1.byteShare }
+        return streams.reduce(0.0) { $0 + $1.progressFraction * $1.workShare }
     }
 
     func appendLog(_ line: String) {
