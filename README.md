@@ -9,6 +9,8 @@ A native macOS app for `rsync` transfers — local↔local, local↔SSH remote, 
 - Browse button for remote paths — navigates the remote filesystem live over SSH, no need to type paths blind
 - Real parallel transfers — indexes the source (size *and* file count per item), splits it into N balanced groups, and runs N `rsync` processes concurrently over separate connections. Two things keep the streams finishing together: balancing counts files as well as bytes (rsync's per-file cost means a dense tree of small files can take longer than a single much larger file), and a directory too big for one stream is split into its own subfolders via `rsync -R` rather than pinning a stream on its own
 - Resumes interrupted transfers (`--partial`) instead of starting over
+- Live progress that means something: total % weighted by files as well as bytes (so a long tail of small files doesn't sit at 99%), current speed, time elapsed, and estimated time remaining
+- Each window is its own independent transfer — open a new window (⌘N) to run another one alongside
 - Remote-to-remote transfers relay item by item, deleting each item from local staging as soon as it's confirmed on the target — so a transfer can move more data than fits on this Mac's free disk at once. Optionally overlaps each item's upload with the next item's download for speed, at the cost of roughly double the peak local disk per stream
 - Standard `rsync` options: compression, archive mode, delete-extraneous, dry run, bandwidth limit, exclude patterns, extra flags
 - Swap button to flip source/target, and confirmation prompts before a transfer that would delete files or where source and target point at the same place

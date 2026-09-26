@@ -809,4 +809,69 @@ final class TransferManagerTests: XCTestCase {
         XCTAssertFalse(success, "an unreachable relay leg should fail, not silently succeed")
         XCTAssertTrue(manager.state.logLines.contains { $0.contains("relaying through a local staging folder") })
     }
+
+    // MARK: - Independent windows and live metrics
+
+    /// Each window owns its own manager. Two transfers started side by side
+    /// must both actually run at the same time and both land intact — before,
+    /// every window shared one manager, so the second Start was swallowed.
+    /// Also checks the live figures a running transfer shows.
+    func testTwoManagersRunIndependentTransfersConcurrentlyWithLiveMetrics() async throws {
+        var managers: [TransferManager] = []
+        var sources: [URL] = []
+        var targets: [URL] = []
+        for index in 0..<2 {
+            let source = testDir.appendingPathComponent("win\(index)-src")
+            let target = testDir.appendingPathComponent("win\(index)-dst")
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+            var payload = Data(count: 1_500_000)
+            payload.withUnsafeMutableBytes { arc4random_buf($0.baseAddress!, $0.count) }
+            try payload.write(to: source.appendingPathComponent("payload.bin"))
+            for n in 0..<50 { try Data("\(n)".utf8).write(to: source.appendingPathComponent("small\(n).txt")) }
+            sources.append(source)
+            targets.append(target)
+
+            let options = RsyncOptions()
+            options.compress = false
+            options.bandwidthLimitKBps = "400"
+            let manager = TransferManager()
+            manager.start(source: localEndpoint(label: "Source", path: source), target: localEndpoint(label: "Target", path: target), options: options)
+            managers.append(manager)
+        }
+
+        var sawBothActive = false
+        var sawSpeed = false
+        var sawEstimate = false
+        var lastProgress = [0.0, 0.0]
+        let deadline = Date().addingTimeInterval(40)
+        while Date() < deadline, managers.contains(where: { $0.isTransferActive }) {
+            if managers.allSatisfy({ $0.state.phase == .running }) { sawBothActive = true }
+            for (index, manager) in managers.enumerated() where manager.state.phase == .running {
+                let progress = manager.state.overallProgress
+                XCTAssertGreaterThanOrEqual(progress, lastProgress[index], "progress must never move backwards")
+                lastProgress[index] = progress
+                if manager.state.bytesPerSecond > 0 { sawSpeed = true }
+                if manager.state.secondsRemaining != nil { sawEstimate = true }
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        XCTAssertTrue(sawBothActive, "both transfers should have been running at the same time")
+        XCTAssertTrue(sawSpeed, "a running transfer should report its speed")
+        XCTAssertTrue(sawEstimate, "a running transfer should estimate time remaining")
+
+        for (index, manager) in managers.enumerated() {
+            XCTAssertEqual(manager.state.phase, .finished(success: true))
+            XCTAssertEqual(manager.state.overallProgress, 1, accuracy: 0.001)
+            XCTAssertGreaterThan(manager.state.elapsed ?? 0, 2, "elapsed should cover the throttled transfer")
+            XCTAssertGreaterThanOrEqual(manager.state.bytesTransferred, 1_500_000)
+            // Average speed once done, in the right ballpark for the 400KB/s cap.
+            XCTAssertEqual(manager.state.bytesPerSecond, 400 * 1024, accuracy: 250 * 1024)
+            let src = try Data(contentsOf: sources[index].appendingPathComponent("payload.bin"))
+            let dst = try Data(contentsOf: targets[index].appendingPathComponent("payload.bin"))
+            XCTAssertEqual(src, dst)
+        }
+        XCTAssertTrue(TransferManager.active.isEmpty)
+    }
 }

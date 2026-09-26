@@ -22,6 +22,17 @@ final class TransferManager {
 
     var isTransferActive: Bool { jobInFlight }
 
+    /// Every live manager — one per window — so quitting can check and stop
+    /// all of them, not just whichever window happens to be frontmost.
+    private static let all = NSHashTable<TransferManager>.weakObjects()
+    static var active: [TransferManager] {
+        all.allObjects.filter { $0.isTransferActive }
+    }
+
+    init() {
+        Self.all.add(self)
+    }
+
     func start(source: Endpoint, target: Endpoint, options: RsyncOptions) {
         guard !jobInFlight else { return }
         jobInFlight = true
@@ -38,6 +49,8 @@ final class TransferManager {
             jobInFlight = false
             return
         }
+        state.startedAt = Date()
+        startSampler(generation: generation)
         // Chain onto the previous job rather than running alongside it. After a
         // cancel its Task may still be unwinding, and the two share isCancelled
         // and runningProcesses — starting the new job on top of that would
@@ -75,6 +88,62 @@ final class TransferManager {
         jobGeneration += 1
         state.phase = .cancelled
         state.statusMessage = "Cancelled."
+        settleMetrics()
+    }
+
+    /// Once a second while the job runs: measures speed from how fast the
+    /// byte counts climb, and time remaining from how fast overall progress
+    /// climbs. The two are deliberately separate — progress is weighted by
+    /// file count as well as bytes, so a byte rate alone would promise a
+    /// small-file tail finishes far sooner than it will.
+    private func startSampler(generation: Int) {
+        Task { @MainActor [weak self] in
+            var bytesWindow = RateWindow(span: 5)
+            var progressWindow = RateWindow(span: 30)
+            var streamWindows: [ObjectIdentifier: RateWindow] = [:]
+            let origin = Date()
+            while true {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, generation == self.jobGeneration, self.jobInFlight else { return }
+                let state = self.state
+                let now = Date()
+                let t = now.timeIntervalSince(origin)
+                state.now = now
+
+                bytesWindow.add(Double(state.bytesTransferred), at: t)
+                state.bytesPerSecond = bytesWindow.rate ?? 0
+                for stream in state.streams {
+                    var window = streamWindows[ObjectIdentifier(stream)] ?? RateWindow(span: 5)
+                    window.add(Double(stream.bytesTransferred), at: t)
+                    stream.bytesPerSecond = stream.isRunning ? (window.rate ?? 0) : 0
+                    streamWindows[ObjectIdentifier(stream)] = window
+                }
+
+                // Only once transferring: indexing moves nothing, and folding
+                // that pause into the window would inflate the estimate.
+                guard state.phase == .running else { continue }
+                let progress = state.overallProgress
+                progressWindow.add(progress, at: t)
+                if let rate = progressWindow.rate, rate > 0 {
+                    state.secondsRemaining = (1 - progress) / rate
+                } else {
+                    state.secondsRemaining = nil
+                }
+            }
+        }
+    }
+
+    /// Freezes the clock and replaces the live speed with the job's average,
+    /// which is the more useful number once nothing is moving.
+    private func settleMetrics() {
+        let now = Date()
+        state.finishedAt = now
+        state.now = now
+        state.secondsRemaining = nil
+        for stream in state.streams { stream.bytesPerSecond = 0 }
+        if let elapsed = state.elapsed, elapsed > 0 {
+            state.bytesPerSecond = Double(state.bytesTransferred) / elapsed
+        }
     }
 
     enum LegOutcome: Equatable {
@@ -168,6 +237,8 @@ final class TransferManager {
         let streamState = StreamState(id: 0)
         streamState.workShare = 1
         streamState.itemsTotal = 1
+        // Not indexed, so each leg counts as one unit of rsync's own percentage.
+        streamState.totalCostKB = options.dryRun ? 1 : 2
         state.streams = [streamState]
         state.phase = .running
 
@@ -182,7 +253,7 @@ final class TransferManager {
             return .failure(message)
         }
         runningProcesses = [downloadProcess]
-        await runStream(process: downloadProcess, streamState: streamState)
+        await runStream(process: downloadProcess, streamState: streamState, legCostKB: nil)
         runningProcesses = []
         if isCancelled { return .cancelled }
         guard streamState.exitCode == 0 else { return .failure(nil) }
@@ -207,7 +278,6 @@ final class TransferManager {
         stagedFile.localPath = PathUtilities.join(staging.localPath, fileName)
 
         streamState.currentFile = "Uploading…"
-        streamState.progressFraction = 0
         state.statusMessage = "Uploading to \(target.host)…"
         let uploadProcess: Process
         do {
@@ -218,7 +288,7 @@ final class TransferManager {
             return .failure(message)
         }
         runningProcesses = [uploadProcess]
-        await runStream(process: uploadProcess, streamState: streamState)
+        await runStream(process: uploadProcess, streamState: streamState, legCostKB: nil)
         runningProcesses = []
         if isCancelled { return .cancelled }
         guard streamState.exitCode == 0 else { return .failure(nil) }
@@ -272,6 +342,10 @@ final class TransferManager {
 
         let plans = SplitPlanner.plan(items: items, streamCount: options.streamCount)
         let grandTotal = max(plans.reduce(0) { $0 + $1.cost }, 1)
+        let itemCosts = Dictionary(items.map { ($0.name, Double(SplitPlanner.cost(of: $0))) }, uniquingKeysWith: { first, _ in first })
+        // Each item goes down and then up again, except under a dry run,
+        // which only previews the download.
+        let legsPerItem: Double = options.dryRun ? 1 : 2
 
         var groups: [(streamState: StreamState, itemNames: [String])] = []
         for (index, plan) in plans.enumerated() {
@@ -279,6 +353,7 @@ final class TransferManager {
             streamState.itemNames = plan.itemNames
             streamState.itemsTotal = plan.itemNames.count
             streamState.workShare = Double(plan.cost) / Double(grandTotal)
+            streamState.totalCostKB = Double(plan.cost) * legsPerItem
             groups.append((streamState, plan.itemNames))
         }
 
@@ -294,8 +369,8 @@ final class TransferManager {
                 group.addTask { [weak self] in
                     guard let self else { return false }
                     return pipelined
-                        ? await self.runGroupPipelined(itemNames: itemNames, source: source, staging: staging, target: target, options: options, streamState: streamState)
-                        : await self.runGroupSequential(itemNames: itemNames, source: source, staging: staging, target: target, options: options, streamState: streamState)
+                        ? await self.runGroupPipelined(itemNames: itemNames, itemCosts: itemCosts, source: source, staging: staging, target: target, options: options, streamState: streamState)
+                        : await self.runGroupSequential(itemNames: itemNames, itemCosts: itemCosts, source: source, staging: staging, target: target, options: options, streamState: streamState)
                 }
             }
             var collected: [Bool] = []
@@ -312,10 +387,10 @@ final class TransferManager {
 
     /// One item fully through the pipe before starting the next — lowest
     /// peak disk usage (roughly one item's worth per stream at a time).
-    private func runGroupSequential(itemNames: [String], source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions, streamState: StreamState) async -> Bool {
+    private func runGroupSequential(itemNames: [String], itemCosts: [String: Double], source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions, streamState: StreamState) async -> Bool {
         for (index, name) in itemNames.enumerated() {
             if isCancelled { return false }
-            guard await relayItemLeg(name: name, itemIndex: index + 1, from: source, to: staging, options: options, verb: "Downloading", streamState: streamState) else { return false }
+            guard await relayItemLeg(name: name, costKB: itemCosts[name], itemIndex: index + 1, from: source, to: staging, options: options, verb: "Downloading", streamState: streamState) else { return false }
             if options.dryRun {
                 // Nothing was really staged under -n, so there's nothing to
                 // preview an upload of — a dry run only previews downloads.
@@ -323,7 +398,7 @@ final class TransferManager {
                 continue
             }
             if isCancelled { return false }
-            guard await relayItemLeg(name: name, itemIndex: index + 1, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState) else { return false }
+            guard await relayItemLeg(name: name, costKB: itemCosts[name], itemIndex: index + 1, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState) else { return false }
             deleteLocalItem(name: name, staging: staging)
             await markItemRelayed(name: name, staging: staging)
             await markItemCompleted(streamState)
@@ -334,20 +409,20 @@ final class TransferManager {
     /// Overlaps uploading item N with downloading item N+1 — faster (uses
     /// both connections at once instead of one idling while the other
     /// works), at the cost of roughly double the peak local disk per stream.
-    private func runGroupPipelined(itemNames: [String], source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions, streamState: StreamState) async -> Bool {
+    private func runGroupPipelined(itemNames: [String], itemCosts: [String: Double], source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions, streamState: StreamState) async -> Bool {
         if options.dryRun {
             // Nothing is actually uploaded under a dry run, so there's
             // nothing for pipelining to overlap — fall back to previewing
             // each item's download in turn.
-            return await runGroupSequential(itemNames: itemNames, source: source, staging: staging, target: target, options: options, streamState: streamState)
+            return await runGroupSequential(itemNames: itemNames, itemCosts: itemCosts, source: source, staging: staging, target: target, options: options, streamState: streamState)
         }
         var pending: (name: String, index: Int)?
         for (index, name) in itemNames.enumerated() {
             if isCancelled { return false }
-            async let downloadOK = relayItemLeg(name: name, itemIndex: index + 1, from: source, to: staging, options: options, verb: "Downloading", streamState: streamState)
+            async let downloadOK = relayItemLeg(name: name, costKB: itemCosts[name], itemIndex: index + 1, from: source, to: staging, options: options, verb: "Downloading", streamState: streamState)
 
             if let pending {
-                let uploadOK = await relayItemLeg(name: pending.name, itemIndex: pending.index, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState)
+                let uploadOK = await relayItemLeg(name: pending.name, costKB: itemCosts[pending.name], itemIndex: pending.index, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState)
                 guard uploadOK else {
                     _ = await downloadOK
                     return false
@@ -361,7 +436,7 @@ final class TransferManager {
             pending = (name, index + 1)
         }
         if let pending {
-            guard await relayItemLeg(name: pending.name, itemIndex: pending.index, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState) else { return false }
+            guard await relayItemLeg(name: pending.name, costKB: itemCosts[pending.name], itemIndex: pending.index, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState) else { return false }
             deleteLocalItem(name: pending.name, staging: staging)
             await markItemRelayed(name: pending.name, staging: staging)
             await markItemCompleted(streamState)
@@ -371,7 +446,7 @@ final class TransferManager {
 
     /// Runs one item through one leg of the relay (download: source→staging,
     /// or upload: staging→target) as its own rsync process.
-    private func relayItemLeg(name: String, itemIndex: Int, from source: Endpoint, to target: Endpoint, options: RsyncOptions, verb: String, streamState: StreamState) async -> Bool {
+    private func relayItemLeg(name: String, costKB: Double?, itemIndex: Int, from source: Endpoint, to target: Endpoint, options: RsyncOptions, verb: String, streamState: StreamState) async -> Bool {
         await MainActor.run { streamState.currentFile = "[\(itemIndex)/\(streamState.itemsTotal)] \(verb) \(name)…" }
         let process: Process
         do {
@@ -381,7 +456,7 @@ final class TransferManager {
             return false
         }
         await MainActor.run { runningProcesses.append(process) }
-        let exitCode = await runProcessCapturingOutput(process, streamState: streamState)
+        let exitCode = await runProcessCapturingOutput(process, streamState: streamState, legCostKB: costKB)
         await MainActor.run { runningProcesses.removeAll { $0 === process } }
         return exitCode == 0
     }
@@ -441,14 +516,14 @@ final class TransferManager {
         return Set(contents.split(separator: "\n").map(String.init))
     }
 
-    /// Advances a stream's item-count progress. Wrapped in MainActor.run
+    /// Advances a stream's relayed-item count. Wrapped in MainActor.run
     /// since runGroupSequential/runGroupPipelined run off the main actor
-    /// (each group is its own concurrent task), and this drives the same
-    /// progressFraction the UI reads live.
+    /// (each group is its own concurrent task), and the UI reads it live.
+    /// Progress itself comes from each leg's rsync output, weighted by the
+    /// item's indexed cost, so a large item moves the bar more than a small one.
     private func markItemCompleted(_ streamState: StreamState) async {
         await MainActor.run {
             streamState.itemsCompleted += 1
-            streamState.progressFraction = Double(streamState.itemsCompleted) / Double(max(streamState.itemsTotal, 1))
         }
     }
 
@@ -480,7 +555,11 @@ final class TransferManager {
         }
 
         var plans: [StreamPlan] = []
-        if options.streamCount > 1 && sourceIsDirectory {
+        // Indexed even for a single stream: rsync's own percentage counts
+        // bytes only, so it sits near 100% through a long tail of small files.
+        // Knowing the entry count lets progress weigh those files properly.
+        var indexedCostKB: Double?
+        if sourceIsDirectory {
             state.statusMessage = "Indexing source…"
             do {
                 // Registered so Cancel can terminate the scan: indexing walks
@@ -488,12 +567,17 @@ final class TransferManager {
                 // enough that an uninterruptible one would leave Cancel
                 // looking like it did nothing.
                 let items = try await SizeLister.list(for: source, onStart: registerProcess)
+                indexedCostKB = Double(items.reduce(0) { $0 + SplitPlanner.cost(of: $1) })
                 if items.isEmpty {
-                    state.appendLog("Source directory has nothing to split — running as a single stream.")
+                    if options.streamCount > 1 {
+                        state.appendLog("Source directory has nothing to split — running as a single stream.")
+                    }
                 } else {
                     let totalEntries = items.reduce(0) { $0 + $1.entryCount }
                     let totalKB = items.reduce(0) { $0 + $1.sizeKB }
                     state.appendLog("Indexed \(items.count) top-level item(s): \(Self.formatKB(totalKB)) across \(totalEntries) entries.")
+                }
+                if options.streamCount > 1 && !items.isEmpty {
                     let refined = await refineForBalance(items: items, in: source, options: options)
                     state.statusMessage = "Planning \(options.streamCount) parallel streams…"
                     plans = SplitPlanner.plan(items: refined, streamCount: options.streamCount)
@@ -502,7 +586,9 @@ final class TransferManager {
                     }
                 }
             } catch {
-                state.appendLog("Couldn't split source for parallel streams (\(error.localizedDescription)) — falling back to a single stream.")
+                state.appendLog(options.streamCount > 1
+                    ? "Couldn't split source for parallel streams (\(error.localizedDescription)) — falling back to a single stream."
+                    : "Couldn't index source (\(error.localizedDescription)) — progress will follow rsync's byte count only.")
             }
         }
 
@@ -512,27 +598,29 @@ final class TransferManager {
         // the user just cancelled.
         if isCancelled { return .cancelled }
 
-        var jobs: [(process: Process, streamState: StreamState)] = []
+        var jobs: [(process: Process, streamState: StreamState, costKB: Double?)] = []
         do {
             if plans.isEmpty {
                 let streamState = StreamState(id: 0)
                 streamState.workShare = 1
+                streamState.totalCostKB = indexedCostKB ?? 1
                 let process = try RsyncCommandBuilder.buildProcess(
                     source: source, target: target, itemNames: nil,
                     sourceIsDirectory: sourceIsDirectory, options: options
                 )
-                jobs.append((process, streamState))
+                jobs.append((process, streamState, indexedCostKB))
             } else {
                 let grandTotal = max(plans.reduce(0) { $0 + $1.cost }, 1)
                 for (index, plan) in plans.enumerated() {
                     let streamState = StreamState(id: index)
                     streamState.itemNames = plan.itemNames
                     streamState.workShare = Double(plan.cost) / Double(grandTotal)
+                    streamState.totalCostKB = Double(plan.cost)
                     let process = try RsyncCommandBuilder.buildProcess(
                         source: source, target: target, itemNames: plan.itemNames,
                         sourceIsDirectory: sourceIsDirectory, options: options
                     )
-                    jobs.append((process, streamState))
+                    jobs.append((process, streamState, Double(plan.cost)))
                 }
             }
         } catch {
@@ -549,8 +637,9 @@ final class TransferManager {
             for job in jobs {
                 let process = job.process
                 let streamState = job.streamState
+                let costKB = job.costKB
                 group.addTask { [weak self] in
-                    await self?.runStream(process: process, streamState: streamState)
+                    await self?.runStream(process: process, streamState: streamState, legCostKB: costKB)
                 }
             }
         }
@@ -567,6 +656,7 @@ final class TransferManager {
         guard generation == jobGeneration else { return }
         runningProcesses = []
         jobInFlight = false
+        settleMetrics()
         switch outcome {
         case .success:
             state.phase = .finished(success: true)
@@ -586,11 +676,12 @@ final class TransferManager {
         state.appendLog(message)
         state.phase = .finished(success: false)
         jobInFlight = false
+        settleMetrics()
     }
 
-    private func runStream(process: Process, streamState: StreamState) async {
+    private func runStream(process: Process, streamState: StreamState, legCostKB: Double?) async {
         await MainActor.run { streamState.isRunning = true }
-        let exitCode = await runProcessCapturingOutput(process, streamState: streamState)
+        let exitCode = await runProcessCapturingOutput(process, streamState: streamState, legCostKB: legCostKB)
         await MainActor.run {
             streamState.isRunning = false
             streamState.exitCode = exitCode
@@ -605,17 +696,21 @@ final class TransferManager {
     /// directly rather than through shared mutable state — safe to call
     /// concurrently for the same stream (e.g. a pipelined relay's
     /// overlapping download/upload).
-    private func runProcessCapturingOutput(_ process: Process, streamState: StreamState) async -> Int32 {
+    ///
+    /// - legCostKB: the indexed work this process covers (see LegProgress),
+    ///   nil if unknown.
+    private func runProcessCapturingOutput(_ process: Process, streamState: StreamState, legCostKB: Double?) async -> Int32 {
         let streamID = streamState.id
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        let leg = await MainActor.run { streamState.beginLeg(costKB: legCostKB) }
 
         let onLine: (String) -> Void = { [weak self] line in
             guard let self else { return }
             Task { @MainActor in
-                self.handleOutputLine(line, for: streamState)
+                self.handleOutputLine(line, for: streamState, leg: leg)
             }
         }
 
@@ -654,11 +749,13 @@ final class TransferManager {
             }
         }
 
-        return process.isRunning ? -1 : process.terminationStatus
+        let exitCode = process.isRunning ? -1 : process.terminationStatus
+        await MainActor.run { streamState.endLeg(leg, succeeded: exitCode == 0) }
+        return exitCode
     }
 
     @MainActor
-    private func handleOutputLine(_ line: String, for streamState: StreamState) {
+    private func handleOutputLine(_ line: String, for streamState: StreamState, leg: LegProgress) {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
         // A cancelled job's processes keep draining output while they wind
@@ -668,20 +765,20 @@ final class TransferManager {
         guard state.streams.contains(where: { $0 === streamState }) else { return }
         state.appendLog("[Stream \(streamState.id + 1)] \(trimmed)")
 
-        // Streams relaying more than one item (itemsTotal > 1) track progress
-        // by item count instead — each item's process restarts near 0%, so
-        // feeding its raw per-process percentage into progressFraction would
-        // make the bar sawtooth (jump forward as one item finishes, then
-        // fall back as the next item's process starts). It would also race
-        // against a concurrently-running sibling process in pipelined mode,
-        // since both share this same StreamState. relayItemLeg sets
-        // currentFile itself for these streams, so raw output only needs to
-        // reach the log here.
-        guard streamState.itemsTotal <= 1 else { return }
+        // Progress goes to this process's own leg, not straight into the
+        // stream: a relay stream runs one process per item (and two at once
+        // when pipelined), each restarting near 0%, and the stream's figure
+        // is the cost-weighted sum over all of them.
+        if let update = RsyncProgressParser.parse(trimmed) {
+            leg.apply(update, cumulativeBytes: RsyncCapabilities.supportsInfoProgress2)
+            streamState.recompute()
+            return
+        }
 
-        if let percent = Self.parsePercent(trimmed) {
-            streamState.progressFraction = Double(percent) / 100.0
-        } else if !trimmed.contains("%") && !trimmed.hasPrefix("⚠︎") {
+        // relayItemLeg sets currentFile itself for multi-item streams, so raw
+        // output only needs to reach the log for those.
+        guard streamState.itemsTotal <= 1 else { return }
+        if !trimmed.contains("%") && !trimmed.hasPrefix("⚠︎") {
             streamState.currentFile = trimmed
         }
     }
@@ -725,22 +822,5 @@ final class TransferManager {
 
     private static func formatKB(_ kb: Int) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(kb) * 1024, countStyle: .file)
-    }
-
-    private static func parsePercent(_ line: String) -> Int? {
-        guard let percentRange = line.range(of: "%") else { return nil }
-        var digits = ""
-        var index = percentRange.lowerBound
-        while index > line.startIndex {
-            let prev = line.index(before: index)
-            let ch = line[prev]
-            if ch.isNumber {
-                digits = String(ch) + digits
-                index = prev
-            } else {
-                break
-            }
-        }
-        return Int(digits)
     }
 }

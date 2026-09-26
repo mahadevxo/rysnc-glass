@@ -1,7 +1,9 @@
 import SwiftUI
 
 struct ContentView: View {
-    var transferManager: TransferManager
+    // One per window, so a new window is a new, independent transfer rather
+    // than a second view onto the first one.
+    @State private var transferManager = TransferManager()
 
     @State private var source = Endpoint(label: "Source")
     @State private var target = Endpoint(label: "Target")
@@ -43,6 +45,11 @@ struct ContentView: View {
         }
         .frame(minWidth: 940, minHeight: 800)
         .background(.background)
+        // Closing the window drops the only UI that could watch or stop this
+        // transfer, so stop it rather than leave rsync running unseen.
+        .onDisappear {
+            if transferManager.isTransferActive { transferManager.cancel() }
+        }
         .alert("Source and Target Are the Same", isPresented: $showSameLocationAlert) {
             Button("Cancel", role: .cancel) {}
             Button("Transfer Anyway", role: .destructive) {

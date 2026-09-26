@@ -61,12 +61,21 @@ enum SizeLister {
         })
     }
 
+    /// Sizes are apparent (bytes in the file), not disk blocks: a 1-byte
+    /// file occupies a 4KB block, so a tree of small files would otherwise
+    /// index several times larger than the data rsync actually sends, and
+    /// progress measured against it would never reach the end. BSD/macOS du
+    /// spells that -A, GNU du --apparent-size; anything else falls back to
+    /// block sizes rather than failing the scan.
     private static func measureScript(root: String, globs: [String]) -> String {
         """
+        if du -A -k /dev/null >/dev/null 2>&1; then A=-A
+        elif du --apparent-size -k /dev/null >/dev/null 2>&1; then A=--apparent-size
+        else A=; fi
         cd \(PathUtilities.shellQuote(root)) || exit 1
         for e in \(globs.joined(separator: " ")); do
           [ -e "$e" ] || [ -L "$e" ] || continue
-          set -- $(du -ak -- "$e" 2>/dev/null | awk '{c++; last=$1} END {print last+0, c+0}')
+          set -- $(du $A -ak -- "$e" 2>/dev/null | awk '{c++; last=$1} END {print last+0, c+0}')
           printf '%s\\t%s\\t%s\\n' "${1:-0}" "${2:-0}" "$e"
         done
         """
