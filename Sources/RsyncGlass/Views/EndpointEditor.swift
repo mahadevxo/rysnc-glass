@@ -11,6 +11,7 @@ private enum EndpointSheet: Identifiable {
     case manage
     case browse
     case editServer
+    case cloudRemotes
     var id: Self { self }
 }
 
@@ -75,6 +76,12 @@ struct EndpointEditor: View {
             case .browse:
                 RemoteBrowserSheet(endpoint: endpoint) { chosenPath in
                     endpoint.remotePath = chosenPath
+                }
+            case .cloudRemotes:
+                CloudRemotesSheet { added in
+                    activeSheet = nil
+                    if let added { endpoint.cloudRemote = added }
+                    Task { cloudRemotes = await RcloneEngine.listRemotes() }
                 }
             case .editServer:
                 if let editingServer {
@@ -176,21 +183,23 @@ struct EndpointEditor: View {
                     Text("Choose…").tag("")
                     ForEach(cloudRemotes ?? [], id: \.self) { Text($0).tag($0) }
                 }
-                Button {
-                    Task { cloudRemotes = await RcloneEngine.listRemotes() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .help("Reload remotes from your rclone config")
+                Button("Manage…") { present(.cloudRemotes) }
+                    .help("Add, test or delete cloud remotes")
             }
             TextField("path/in/remote (empty for its root)", text: $endpoint.cloudPath)
                 .fieldStyle()
-            Text(cloudRemotes?.isEmpty == true
-                 ? "No remotes in your rclone config yet. Add one in Terminal with: rclone config"
-                 : "Remotes come from your rclone config. Transfers involving cloud storage run with rclone.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if cloudRemotes?.isEmpty == true {
+                Button {
+                    present(.cloudRemotes)
+                } label: {
+                    Label("Add a cloud remote…", systemImage: "plus.circle")
+                }
+                .buttonStyle(.link)
+            } else {
+                Text("Remotes come from your rclone config. Transfers involving cloud storage run with rclone.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .task { if cloudRemotes == nil { cloudRemotes = await RcloneEngine.listRemotes() } }
     }

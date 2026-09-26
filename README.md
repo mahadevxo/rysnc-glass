@@ -5,6 +5,7 @@ A native macOS app for `rsync` transfers — local↔local, local↔SSH remote, 
 ## Features
 
 - Source and target can each be a local folder, a remote SSH server (host/port/username, key or password auth), or cloud storage from your rclone config (Google Drive, S3, …)
+- Add, test and delete cloud remotes inside the app: pick any of rclone's ~70 providers and fill in a form generated from rclone's own description of it. Providers that need a sign-in (Google Drive, Dropbox, OneDrive…) open your browser, and any follow-up questions rclone asks are shown in the app. Passwords are stored obscured in your rclone config, the way rclone itself stores them
 - Saved server profiles — save a connection once, pick it from a menu next time. Passwords go in Keychain, never in a plaintext settings file
 - Browse button for remote paths — navigates the remote filesystem live over SSH, no need to type paths blind
 - Real parallel transfers — indexes the source (size *and* file count per item) and breaks it into chunks, opening up any folder too big to deal out evenly (including flat folders of thousands of files), then runs N `rsync` processes that each take the next chunk as soon as they're free. Chunks start large and shrink as the queue drains, so streams finish close together even when a folder turns out slower than its size suggested, and no stream sits idle while another grinds on
@@ -26,7 +27,7 @@ A native macOS app for `rsync` transfers — local↔local, local↔SSH remote, 
 - macOS 26 or later
 - Xcode 26 or later — the **full app**, not just the Command Line Tools (`xcode-select --install` alone won't have the macOS 26 SDK this needs)
 
-The prebuilt app bundles its own copies of `rsync`, `sshpass` and `rclone` (Apple Silicon only — see Notes below), so none of them needs to be installed separately. For cloud storage, add remotes with `rclone config` once; the app uses your existing rclone config. If you build it yourself and Homebrew's `rsync`/`sshpass` are on `PATH` at build time, `build_app.sh` bundles those; otherwise the app falls back to searching common install locations (Homebrew, `/usr/bin`, etc.) at runtime, same as before bundling existed.
+The prebuilt app bundles its own copies of `rsync`, `sshpass` and `rclone` (Apple Silicon only — see Notes below), so none of them needs to be installed separately. For cloud storage, add remotes from the app (Cloud endpoint → Manage…); they're stored in your normal rclone config, so remotes made with `rclone config` show up too. If you build it yourself and Homebrew's `rsync`/`sshpass` are on `PATH` at build time, `build_app.sh` bundles those; otherwise the app falls back to searching common install locations (Homebrew, `/usr/bin`, etc.) at runtime, same as before bundling existed.
 
 **Optional, if not bundled:**
 - [Homebrew](https://brew.sh) `rsync` (`brew install rsync`) — macOS ships an ancient rsync (2.6.9) for licensing reasons; the app detects and works around it either way, but a modern one enables nicer progress reporting

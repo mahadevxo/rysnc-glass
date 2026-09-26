@@ -11,11 +11,14 @@ enum ProcessRunner {
     /// - onStart: called with the process once it's running, so a caller can
     ///   keep a handle on it and terminate it early. Indexing a large remote
     ///   tree takes real time, and without this a cancel can't interrupt it.
-    static func run(_ process: Process, onStart: ((Process) -> Void)? = nil) async throws -> ProcessResult {
+    /// - keepingStderr: leave the process's stderr as the caller set it up
+    ///   (to watch it live), rather than collecting it; result.stderr is
+    ///   then empty.
+    static func run(_ process: Process, onStart: ((Process) -> Void)? = nil, keepingStderr: Bool = false) async throws -> ProcessResult {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
+        if !keepingStderr { process.standardError = stderrPipe }
 
         // Drain both pipes while the process runs, not after it exits: a pipe
         // holds 64KB, and a process that fills it blocks on the write and
@@ -23,7 +26,7 @@ enum ProcessRunner {
         // good on any large output, like a folder with thousands of entries.
         let drained = DispatchGroup()
         let collected = Collected()
-        for (pipe, isStdout) in [(stdoutPipe, true), (stderrPipe, false)] {
+        for (pipe, isStdout) in [(stdoutPipe, true), (stderrPipe, false)] where isStdout || !keepingStderr {
             drained.enter()
             DispatchQueue.global().async {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()

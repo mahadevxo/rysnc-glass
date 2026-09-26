@@ -12,14 +12,11 @@ import Foundation
 enum RcloneEngine {
     enum EngineError: LocalizedError {
         case missing
-        case obscureFailed(String)
 
         var errorDescription: String? {
             switch self {
             case .missing:
                 return "rclone isn't available. It's bundled with the release build; for a development build install it with: brew install rclone"
-            case .obscureFailed(let detail):
-                return "Couldn't prepare the SFTP password for rclone: \(detail)"
             }
         }
     }
@@ -107,7 +104,7 @@ enum RcloneEngine {
                 }
             }
             if endpoint.authMethod == .password {
-                environment[prefix + "PASS"] = try await obscure(endpoint.password)
+                environment[prefix + "PASS"] = try await RcloneConfig.obscure(endpoint.password)
             }
             return name + ":" + sftpPath(endpoint.remotePath)
         }
@@ -159,26 +156,6 @@ enum RcloneEngine {
         if path == "~" { return "" }
         if path.hasPrefix("~/") { return String(path.dropFirst(2)) }
         return path
-    }
-
-    /// rclone wants config passwords obscured. Passed on stdin, not as an
-    /// argument, so it doesn't show up in the process list.
-    private static func obscure(_ password: String) async throws -> String {
-        guard let rclone = CommandLocator.rclone else { throw EngineError.missing }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: rclone)
-        process.arguments = ["obscure", "-"]
-        let input = Pipe()
-        process.standardInput = input
-        async let result = ProcessRunner.run(process)
-        input.fileHandleForWriting.write(Data(password.utf8))
-        try? input.fileHandleForWriting.close()
-        let output = try await result
-        let obscured = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard output.exitCode == 0, !obscured.isEmpty else {
-            throw EngineError.obscureFailed(output.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return obscured
     }
 }
 
