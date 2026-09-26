@@ -235,10 +235,9 @@ final class TransferManager {
     /// rsync itself needs a full local copy before it can push it onward.
     func runRelaySingleFile(source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions) async -> LegOutcome {
         let streamState = StreamState(id: 0)
-        streamState.workShare = 1
         streamState.itemsTotal = 1
         // Not indexed, so each leg counts as one unit of rsync's own percentage.
-        streamState.totalCostKB = options.dryRun ? 1 : 2
+        state.totalCostKB = options.dryRun ? 1 : 2
         state.streams = [streamState]
         state.phase = .running
 
@@ -296,11 +295,11 @@ final class TransferManager {
         return .success
     }
 
-    /// Directory relay: split top-level items across streamCount groups
-    /// (same balancing as local/remote parallel streams), then relay each
-    /// group's items one at a time — sequentially, or pipelined (overlapping
-    /// upload of item N with download of item N+1) depending on
-    /// options.pipelineRelayLegs.
+    /// Directory relay: packs items into chunks (same planning as local/remote
+    /// parallel streams), and each stream takes the next chunk from a shared
+    /// queue as it frees up, relaying it sequentially or pipelined
+    /// (overlapping the upload of one chunk with the download of the next)
+    /// depending on options.pipelineRelayLegs.
     func runRelayDirectory(source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions) async -> LegOutcome {
         state.statusMessage = "Indexing source…"
         let indexed: [SizedItem]
@@ -340,37 +339,37 @@ final class TransferManager {
         // running phase the cancelled job would then be stuck in.
         if isCancelled { return .cancelled }
 
-        let plans = SplitPlanner.plan(items: items, streamCount: options.streamCount)
-        let grandTotal = max(plans.reduce(0) { $0 + $1.cost }, 1)
-        let itemCosts = Dictionary(items.map { ($0.name, Double(SplitPlanner.cost(of: $0))) }, uniquingKeysWith: { first, _ in first })
-        // Each item goes down and then up again, except under a dry run,
+        // Equal, fine-grained chunks rather than shrinking ones: a relayed
+        // chunk sits in local staging until it's uploaded, so its size is
+        // what bounds disk use.
+        let chunks = SplitPlanner.chunks(items: items, streamCount: options.streamCount, shrinking: false)
+        let queue = ChunkQueue(chunks)
+        logChunkPlan(chunks, streamCount: options.streamCount)
+        // Each chunk goes down and then up again, except under a dry run,
         // which only previews the download.
-        let legsPerItem: Double = options.dryRun ? 1 : 2
+        let legsPerChunk: Double = options.dryRun ? 1 : 2
+        state.totalCostKB = Double(chunks.reduce(0) { $0 + $1.cost }) * legsPerChunk
 
-        var groups: [(streamState: StreamState, itemNames: [String])] = []
-        for (index, plan) in plans.enumerated() {
+        let streams = (0..<min(options.streamCount, chunks.count)).map { index -> StreamState in
             let streamState = StreamState(id: index)
-            streamState.itemNames = plan.itemNames
-            streamState.itemsTotal = plan.itemNames.count
-            streamState.workShare = Double(plan.cost) / Double(grandTotal)
-            streamState.totalCostKB = Double(plan.cost) * legsPerItem
-            groups.append((streamState, plan.itemNames))
+            streamState.itemsTotal = items.count
+            return streamState
         }
-
-        state.streams = groups.map { $0.streamState }
+        state.streams = streams
         state.phase = .running
         state.statusMessage = "Relaying \(items.count) item\(items.count == 1 ? "" : "s") through local staging…"
 
         let pipelined = options.pipelineRelayLegs
         let results = await withTaskGroup(of: Bool.self) { group -> [Bool] in
-            for entry in groups {
-                let streamState = entry.streamState
-                let itemNames = entry.itemNames
+            for streamState in streams {
                 group.addTask { [weak self] in
                     guard let self else { return false }
-                    return pipelined
-                        ? await self.runGroupPipelined(itemNames: itemNames, itemCosts: itemCosts, source: source, staging: staging, target: target, options: options, streamState: streamState)
-                        : await self.runGroupSequential(itemNames: itemNames, itemCosts: itemCosts, source: source, staging: staging, target: target, options: options, streamState: streamState)
+                    await MainActor.run { streamState.isRunning = true }
+                    let ok = pipelined
+                        ? await self.relayPipelined(queue: queue, source: source, staging: staging, target: target, options: options, streamState: streamState)
+                        : await self.relaySequential(queue: queue, source: source, staging: staging, target: target, options: options, streamState: streamState)
+                    await MainActor.run { streamState.isRunning = false }
+                    return ok
                 }
             }
             var collected: [Bool] = []
@@ -385,80 +384,99 @@ final class TransferManager {
         return results.allSatisfy { $0 } ? .success : .failure(nil)
     }
 
-    /// One item fully through the pipe before starting the next — lowest
-    /// peak disk usage (roughly one item's worth per stream at a time).
-    private func runGroupSequential(itemNames: [String], itemCosts: [String: Double], source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions, streamState: StreamState) async -> Bool {
-        for (index, name) in itemNames.enumerated() {
-            if isCancelled { return false }
-            guard await relayItemLeg(name: name, costKB: itemCosts[name], itemIndex: index + 1, from: source, to: staging, options: options, verb: "Downloading", streamState: streamState) else { return false }
+    /// One chunk fully through the pipe before taking the next — lowest peak
+    /// disk usage (roughly one chunk's worth per stream at a time).
+    ///
+    /// A stream stops at its first failure rather than moving on: a failed
+    /// upload leaves its chunk in staging, and carrying on would let those
+    /// pile up past the disk bound. The other streams keep draining the queue.
+    private func relaySequential(queue: ChunkQueue, source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions, streamState: StreamState) async -> Bool {
+        while !isCancelled, let (index, chunk) = queue.take() {
+            await MainActor.run { streamState.itemNames += chunk.itemNames }
+            guard await relayChunkLeg(chunk, index: index, of: queue.count, from: source, to: staging, options: options, verb: "Downloading", streamState: streamState) else { return false }
             if options.dryRun {
                 // Nothing was really staged under -n, so there's nothing to
                 // preview an upload of — a dry run only previews downloads.
-                await markItemCompleted(streamState)
+                await markItemsCompleted(chunk.itemNames.count, streamState)
                 continue
             }
             if isCancelled { return false }
-            guard await relayItemLeg(name: name, costKB: itemCosts[name], itemIndex: index + 1, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState) else { return false }
-            deleteLocalItem(name: name, staging: staging)
-            await markItemRelayed(name: name, staging: staging)
-            await markItemCompleted(streamState)
+            guard await relayChunkLeg(chunk, index: index, of: queue.count, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState) else { return false }
+            await finishRelayedChunk(chunk, staging: staging, streamState: streamState)
         }
-        return true
+        return !isCancelled
     }
 
-    /// Overlaps uploading item N with downloading item N+1 — faster (uses
+    /// Overlaps uploading one chunk with downloading the next — faster (uses
     /// both connections at once instead of one idling while the other
     /// works), at the cost of roughly double the peak local disk per stream.
-    private func runGroupPipelined(itemNames: [String], itemCosts: [String: Double], source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions, streamState: StreamState) async -> Bool {
+    private func relayPipelined(queue: ChunkQueue, source: Endpoint, staging: Endpoint, target: Endpoint, options: RsyncOptions, streamState: StreamState) async -> Bool {
         if options.dryRun {
             // Nothing is actually uploaded under a dry run, so there's
             // nothing for pipelining to overlap — fall back to previewing
-            // each item's download in turn.
-            return await runGroupSequential(itemNames: itemNames, itemCosts: itemCosts, source: source, staging: staging, target: target, options: options, streamState: streamState)
+            // each chunk's download in turn.
+            return await relaySequential(queue: queue, source: source, staging: staging, target: target, options: options, streamState: streamState)
         }
-        var pending: (name: String, index: Int)?
-        for (index, name) in itemNames.enumerated() {
-            if isCancelled { return false }
-            async let downloadOK = relayItemLeg(name: name, costKB: itemCosts[name], itemIndex: index + 1, from: source, to: staging, options: options, verb: "Downloading", streamState: streamState)
+        var pending: (index: Int, chunk: WorkChunk)?
+        while !isCancelled, let (index, chunk) = queue.take() {
+            await MainActor.run { streamState.itemNames += chunk.itemNames }
+            async let downloadOK = relayChunkLeg(chunk, index: index, of: queue.count, from: source, to: staging, options: options, verb: "Downloading", streamState: streamState)
 
             if let pending {
-                let uploadOK = await relayItemLeg(name: pending.name, costKB: itemCosts[pending.name], itemIndex: pending.index, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState)
+                let uploadOK = await relayChunkLeg(pending.chunk, index: pending.index, of: queue.count, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState)
                 guard uploadOK else {
                     _ = await downloadOK
                     return false
                 }
-                deleteLocalItem(name: pending.name, staging: staging)
-                await markItemRelayed(name: pending.name, staging: staging)
-                await markItemCompleted(streamState)
+                await finishRelayedChunk(pending.chunk, staging: staging, streamState: streamState)
             }
 
             guard await downloadOK else { return false }
-            pending = (name, index + 1)
+            pending = (index, chunk)
         }
-        if let pending {
-            guard await relayItemLeg(name: pending.name, costKB: itemCosts[pending.name], itemIndex: pending.index, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState) else { return false }
-            deleteLocalItem(name: pending.name, staging: staging)
-            await markItemRelayed(name: pending.name, staging: staging)
-            await markItemCompleted(streamState)
+        if let pending, !isCancelled {
+            guard await relayChunkLeg(pending.chunk, index: pending.index, of: queue.count, from: staging, to: target, options: options, verb: "Uploading", streamState: streamState) else { return false }
+            await finishRelayedChunk(pending.chunk, staging: staging, streamState: streamState)
         }
-        return true
+        return !isCancelled
     }
 
-    /// Runs one item through one leg of the relay (download: source→staging,
+    /// A chunk is on the target: free its staging space and record it so a
+    /// resumed run skips it.
+    private func finishRelayedChunk(_ chunk: WorkChunk, staging: Endpoint, streamState: StreamState) async {
+        for name in chunk.itemNames {
+            deleteLocalItem(name: name, staging: staging)
+            await markItemRelayed(name: name, staging: staging)
+        }
+        await markItemsCompleted(chunk.itemNames.count, streamState)
+    }
+
+    /// Runs one chunk through one leg of the relay (download: source→staging,
     /// or upload: staging→target) as its own rsync process.
-    private func relayItemLeg(name: String, costKB: Double?, itemIndex: Int, from source: Endpoint, to target: Endpoint, options: RsyncOptions, verb: String, streamState: StreamState) async -> Bool {
-        await MainActor.run { streamState.currentFile = "[\(itemIndex)/\(streamState.itemsTotal)] \(verb) \(name)…" }
+    private func relayChunkLeg(_ chunk: WorkChunk, index: Int, of total: Int, from source: Endpoint, to target: Endpoint, options: RsyncOptions, verb: String, streamState: StreamState) async -> Bool {
+        let label = chunk.itemNames.count == 1 ? chunk.itemNames[0] : "\(chunk.itemNames.count) items"
+        await MainActor.run { streamState.currentFile = "[chunk \(index)/\(total)] \(verb) \(label)…" }
         let process: Process
         do {
-            process = try RsyncCommandBuilder.buildProcess(source: source, target: target, itemNames: [name], sourceIsDirectory: true, options: options)
+            process = try RsyncCommandBuilder.buildProcess(source: source, target: target, itemNames: chunk.itemNames, sourceIsDirectory: true, options: options)
         } catch {
-            state.appendLog("Couldn't build \(verb.lowercased()) command for \(name): \(error.localizedDescription)")
+            state.appendLog("Couldn't build \(verb.lowercased()) command for \(label): \(error.localizedDescription)")
             return false
         }
-        await MainActor.run { runningProcesses.append(process) }
-        let exitCode = await runProcessCapturingOutput(process, streamState: streamState, legCostKB: costKB)
+        guard await register(process) else { return false }
+        let exitCode = await runProcessCapturingOutput(process, streamState: streamState, legCostKB: Double(chunk.cost))
         await MainActor.run { runningProcesses.removeAll { $0 === process } }
         return exitCode == 0
+    }
+
+    /// Adds a process to the set cancel() terminates — unless a cancel has
+    /// already landed, in which case the caller shouldn't start it at all.
+    private func register(_ process: Process) async -> Bool {
+        await MainActor.run {
+            guard !isCancelled else { return false }
+            runningProcesses.append(process)
+            return true
+        }
     }
 
     /// True if this item, or a directory containing it, was already relayed.
@@ -516,14 +534,13 @@ final class TransferManager {
         return Set(contents.split(separator: "\n").map(String.init))
     }
 
-    /// Advances a stream's relayed-item count. Wrapped in MainActor.run
-    /// since runGroupSequential/runGroupPipelined run off the main actor
-    /// (each group is its own concurrent task), and the UI reads it live.
-    /// Progress itself comes from each leg's rsync output, weighted by the
-    /// item's indexed cost, so a large item moves the bar more than a small one.
-    private func markItemCompleted(_ streamState: StreamState) async {
+    /// Advances a stream's finished-item count. Wrapped in MainActor.run
+    /// since streams run as concurrent tasks off the main actor, and the UI
+    /// reads it live. Progress itself comes from each leg's rsync output,
+    /// weighted by the chunk's indexed cost.
+    private func markItemsCompleted(_ count: Int, _ streamState: StreamState) async {
         await MainActor.run {
-            streamState.itemsCompleted += 1
+            streamState.itemsCompleted += count
         }
     }
 
@@ -554,7 +571,7 @@ final class TransferManager {
             return .failure(nil)
         }
 
-        var plans: [StreamPlan] = []
+        var chunks: [WorkChunk] = []
         // Indexed even for a single stream: rsync's own percentage counts
         // bytes only, so it sits near 100% through a long tail of small files.
         // Knowing the entry count lets progress weigh those files properly.
@@ -580,10 +597,8 @@ final class TransferManager {
                 if options.streamCount > 1 && !items.isEmpty {
                     let refined = await refineForBalance(items: items, in: source, options: options)
                     state.statusMessage = "Planning \(options.streamCount) parallel streams…"
-                    plans = SplitPlanner.plan(items: refined, streamCount: options.streamCount)
-                    for (index, plan) in plans.enumerated() {
-                        state.appendLog("Stream \(index + 1): \(plan.itemNames.count) item(s), \(Self.formatKB(plan.totalKB)).")
-                    }
+                    chunks = SplitPlanner.chunks(items: refined, streamCount: options.streamCount)
+                    logChunkPlan(chunks, streamCount: options.streamCount)
                 }
             } catch {
                 state.appendLog(options.streamCount > 1
@@ -598,55 +613,97 @@ final class TransferManager {
         // the user just cancelled.
         if isCancelled { return .cancelled }
 
-        var jobs: [(process: Process, streamState: StreamState, costKB: Double?)] = []
-        do {
-            if plans.isEmpty {
-                let streamState = StreamState(id: 0)
-                streamState.workShare = 1
-                streamState.totalCostKB = indexedCostKB ?? 1
-                let process = try RsyncCommandBuilder.buildProcess(
+        if chunks.isEmpty {
+            let streamState = StreamState(id: 0)
+            // An empty directory indexes as zero work; count the one process
+            // as a unit then, so finishing it still reads as 100%.
+            let costKB = (indexedCostKB ?? 0) > 0 ? indexedCostKB : nil
+            state.totalCostKB = costKB ?? 1
+            let process: Process
+            do {
+                process = try RsyncCommandBuilder.buildProcess(
                     source: source, target: target, itemNames: nil,
                     sourceIsDirectory: sourceIsDirectory, options: options
                 )
-                jobs.append((process, streamState, indexedCostKB))
-            } else {
-                let grandTotal = max(plans.reduce(0) { $0 + $1.cost }, 1)
-                for (index, plan) in plans.enumerated() {
-                    let streamState = StreamState(id: index)
-                    streamState.itemNames = plan.itemNames
-                    streamState.workShare = Double(plan.cost) / Double(grandTotal)
-                    streamState.totalCostKB = Double(plan.cost)
-                    let process = try RsyncCommandBuilder.buildProcess(
-                        source: source, target: target, itemNames: plan.itemNames,
-                        sourceIsDirectory: sourceIsDirectory, options: options
-                    )
-                    jobs.append((process, streamState, Double(plan.cost)))
-                }
+            } catch {
+                fail("Couldn't build rsync command: \(error.localizedDescription)", generation: generation)
+                return .failure(nil)
             }
-        } catch {
-            fail("Couldn't build rsync command: \(error.localizedDescription)", generation: generation)
-            return .failure(nil)
+            state.streams = [streamState]
+            runningProcesses = [process]
+            state.phase = .running
+            state.statusMessage = "Transferring…"
+            await runStream(process: process, streamState: streamState, legCostKB: costKB)
+            runningProcesses = []
+            if isCancelled { return .cancelled }
+            return streamState.exitCode == 0 ? .success : .failure(nil)
         }
 
-        state.streams = jobs.map { $0.streamState }
-        runningProcesses = jobs.map { $0.process }
+        let queue = ChunkQueue(chunks)
+        state.totalCostKB = Double(chunks.reduce(0) { $0 + $1.cost })
+        let streams = (0..<min(options.streamCount, chunks.count)).map { StreamState(id: $0) }
+        state.streams = streams
         state.phase = .running
         state.statusMessage = "Transferring…"
 
         await withTaskGroup(of: Void.self) { group in
-            for job in jobs {
-                let process = job.process
-                let streamState = job.streamState
-                let costKB = job.costKB
+            for streamState in streams {
                 group.addTask { [weak self] in
-                    await self?.runStream(process: process, streamState: streamState, legCostKB: costKB)
+                    await self?.runChunks(from: queue, streamState: streamState, source: source, target: target, sourceIsDirectory: sourceIsDirectory, options: options)
                 }
             }
         }
 
         runningProcesses = []
         if isCancelled { return .cancelled }
-        return state.streams.allSatisfy { $0.exitCode == 0 } ? .success : .failure(nil)
+        return streams.allSatisfy { $0.exitCode == 0 } ? .success : .failure(nil)
+    }
+
+    /// One stream's loop: take the next chunk, transfer it, repeat until the
+    /// queue is empty. Whichever stream is free takes the next chunk, so they
+    /// all finish within about one chunk of each other however far off the
+    /// cost estimates turn out to be.
+    ///
+    /// Stops at the first failed chunk and leaves the rest to the other
+    /// streams — a failure that's about this source or target, like a full
+    /// disk, would only fail every remaining chunk the same way.
+    private func runChunks(from queue: ChunkQueue, streamState: StreamState, source: Endpoint, target: Endpoint, sourceIsDirectory: Bool, options: RsyncOptions) async {
+        await MainActor.run {
+            streamState.isRunning = true
+            streamState.exitCode = 0
+        }
+        while !isCancelled, let (index, chunk) = queue.take() {
+            await MainActor.run {
+                streamState.itemNames += chunk.itemNames
+                streamState.currentFile = "Chunk \(index) of \(queue.count)"
+            }
+            let process: Process
+            do {
+                process = try RsyncCommandBuilder.buildProcess(
+                    source: source, target: target, itemNames: chunk.itemNames,
+                    sourceIsDirectory: sourceIsDirectory, options: options
+                )
+            } catch {
+                state.appendLog("Couldn't build rsync command for chunk \(index): \(error.localizedDescription)")
+                await MainActor.run { streamState.exitCode = -1 }
+                break
+            }
+            guard await register(process) else { break }
+            let exitCode = await runProcessCapturingOutput(process, streamState: streamState, legCostKB: Double(chunk.cost))
+            await MainActor.run {
+                runningProcesses.removeAll { $0 === process }
+                streamState.exitCode = exitCode
+                if exitCode == 0 { streamState.itemsCompleted += chunk.itemNames.count }
+            }
+            if exitCode != 0 { break }
+        }
+        await MainActor.run { streamState.isRunning = false }
+    }
+
+    private func logChunkPlan(_ chunks: [WorkChunk], streamCount: Int) {
+        guard let largest = chunks.first else { return }
+        let totalKB = chunks.reduce(0) { $0 + $1.totalKB }
+        state.appendLog("Split into \(chunks.count) chunk\(chunks.count == 1 ? "" : "s") for \(min(streamCount, chunks.count)) stream\(streamCount == 1 ? "" : "s"), \(Self.formatKB(totalKB)) in all. Streams take the next chunk as they free up, largest first; the largest is \(Self.formatKB(largest.totalKB)).")
     }
 
     /// Applies a job's terminal state, unless the user has cancelled or
@@ -737,6 +794,11 @@ final class TransferManager {
             }
             do {
                 try process.run()
+                // cancel() only terminates processes that are already
+                // running, so one registered just before a cancel and
+                // launched just after would otherwise transfer a whole
+                // chunk the user has cancelled.
+                if self.isCancelled { process.terminate() }
             } catch {
                 let message = "Stream \(streamID + 1) failed to start: \(error.localizedDescription)"
                 Task { @MainActor in
@@ -822,5 +884,28 @@ final class TransferManager {
 
     private static func formatKB(_ kb: Int) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(kb) * 1024, countStyle: .file)
+    }
+}
+
+/// Hands chunks out, largest first, to whichever stream asks next. Streams
+/// run as concurrent tasks, hence the lock.
+final class ChunkQueue {
+    private let chunks: [WorkChunk]
+    private var nextIndex = 0
+    private let lock = NSLock()
+
+    init(_ chunks: [WorkChunk]) {
+        self.chunks = chunks
+    }
+
+    var count: Int { chunks.count }
+
+    /// The next chunk and its 1-based position, or nil once all are taken.
+    func take() -> (index: Int, chunk: WorkChunk)? {
+        lock.withLock {
+            guard nextIndex < chunks.count else { return nil }
+            defer { nextIndex += 1 }
+            return (nextIndex + 1, chunks[nextIndex])
+        }
     }
 }

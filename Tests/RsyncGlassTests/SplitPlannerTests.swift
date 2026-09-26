@@ -2,64 +2,52 @@ import XCTest
 @testable import RsyncGlass
 
 final class SplitPlannerTests: XCTestCase {
-    func testEvenlySizedItemsSplitOnePerStream() {
-        let items = [
-            SizedItem(name: "a", sizeKB: 100),
-            SizedItem(name: "b", sizeKB: 100),
-            SizedItem(name: "c", sizeKB: 100),
-        ]
-        let plans = SplitPlanner.plan(items: items, streamCount: 3)
-        XCTAssertEqual(plans.count, 3)
-        XCTAssertEqual(Set(plans.map { $0.totalKB }), [100])
-        XCTAssertEqual(Set(plans.flatMap { $0.itemNames }), ["a", "b", "c"])
+    func testSmallItemsShareChunksThatShrinkAsTheQueueDrains() {
+        let items = (0..<2000).map { SizedItem(name: String(format: "f%04d", $0), sizeKB: 10) }
+        let chunks = SplitPlanner.chunks(items: items, streamCount: 4)
+        let finest = items.reduce(0) { $0 + SplitPlanner.cost(of: $1) } / (4 * SplitPlanner.finestChunksPerStream)
+
+        XCTAssertGreaterThanOrEqual(chunks.count, 4 * 4, "enough chunks that streams can even each other out")
+        XCTAssertLessThan(chunks.count, items.count, "small items should share chunks, not each pay for their own process")
+        XCTAssertGreaterThan(chunks.first!.cost, 4 * chunks.last!.cost, "early chunks big, late ones small")
+        XCTAssertLessThanOrEqual(chunks.last!.cost, finest + SplitPlanner.cost(of: items[0]))
     }
 
-    /// This is the core correctness property behind "parallel streams": a big
-    /// item shouldn't get stuck alone on one stream while many small items
-    /// pile onto another, leaving streams wildly unbalanced.
-    func testSkewedSizesStayBalancedAcrossStreams() {
-        let items = [
-            SizedItem(name: "huge", sizeKB: 10_000),
-            SizedItem(name: "small1", sizeKB: 500),
-            SizedItem(name: "small2", sizeKB: 500),
-            SizedItem(name: "small3", sizeKB: 500),
-            SizedItem(name: "small4", sizeKB: 500),
-            SizedItem(name: "small5", sizeKB: 500),
-        ]
-        let plans = SplitPlanner.plan(items: items, streamCount: 2)
-        XCTAssertEqual(plans.count, 2)
-
-        let hugeStream = plans.first { $0.itemNames.contains("huge") }!
-        let otherStream = plans.first { !$0.itemNames.contains("huge") }!
-        // The 5 small items (2500KB total) should all pile onto the stream
-        // that doesn't have the huge item, keeping the two streams close.
-        XCTAssertEqual(otherStream.totalKB, 2500)
-        XCTAssertEqual(hugeStream.totalKB, 10_000)
-        XCTAssertEqual(otherStream.itemNames.count, 5)
+    /// The relay's chunks all stay at the finest size, since each one sits
+    /// in local staging until it's uploaded.
+    func testNonShrinkingChunksAllStayAtTheFinestSize() {
+        let items = (0..<2000).map { SizedItem(name: String(format: "f%04d", $0), sizeKB: 10) }
+        let chunks = SplitPlanner.chunks(items: items, streamCount: 4, shrinking: false)
+        let finest = items.reduce(0) { $0 + SplitPlanner.cost(of: $1) } / (4 * SplitPlanner.finestChunksPerStream)
+        XCTAssertTrue(chunks.allSatisfy { $0.cost <= finest })
     }
 
-    func testMoreStreamsThanItemsProducesOneBucketPerItemNoEmptyBuckets() {
-        let items = [SizedItem(name: "only", sizeKB: 42)]
-        let plans = SplitPlanner.plan(items: items, streamCount: 8)
-        XCTAssertEqual(plans.count, 1, "empty buckets should be filtered out")
-        XCTAssertEqual(plans[0].itemNames, ["only"])
+    /// A file can't be split, so one bigger than a chunk has to travel alone.
+    func testItemBiggerThanTheTargetBecomesItsOwnChunk() {
+        let items = [SizedItem(name: "movie.mkv", sizeKB: 5_000_000)] + (0..<50).map { SizedItem(name: "s\($0)", sizeKB: 100) }
+        let chunks = SplitPlanner.chunks(items: items, streamCount: 4)
+        let movie = chunks.first { $0.itemNames.contains("movie.mkv") }!
+        XCTAssertEqual(movie.itemNames, ["movie.mkv"])
     }
 
-    func testEmptyItemsProducesNoPlans() {
-        XCTAssertEqual(SplitPlanner.plan(items: [], streamCount: 4).count, 0)
+    /// The last chunks handed out decide how far apart the streams finish,
+    /// so the big ones have to go first.
+    func testChunksAreHandedOutLargestFirst() {
+        let items = (1...40).map { SizedItem(name: "d\($0)", sizeKB: $0 * 1000, entryCount: $0) }
+        let costs = SplitPlanner.chunks(items: items, streamCount: 4).map { $0.cost }
+        XCTAssertEqual(costs, costs.sorted(by: >))
     }
 
-    func testStreamCountBelowOneClampedToOne() {
-        let items = [SizedItem(name: "a", sizeKB: 10), SizedItem(name: "b", sizeKB: 20)]
-        let plans = SplitPlanner.plan(items: items, streamCount: 0)
-        XCTAssertEqual(plans.count, 1)
-        XCTAssertEqual(plans[0].totalKB, 30)
+    func testEmptyItemsProduceNoChunks() {
+        XCTAssertTrue(SplitPlanner.chunks(items: [], streamCount: 4).isEmpty)
     }
 
-    func testZeroByteItemsStillGetAtLeastOneKBWeight() {
-        let items = [SizedItem(name: "empty", sizeKB: 0)]
-        let plans = SplitPlanner.plan(items: items, streamCount: 1)
-        XCTAssertEqual(plans[0].totalKB, 1, "totalKB is floored at 1 so workShare math never divides by zero")
+    /// Every name is an argument on an rsync command line.
+    func testChunkNameCountIsCappedToStayUnderArgMax() {
+        let items = (0..<20_000).map { SizedItem(name: "tiny\($0)", sizeKB: 0) }
+        let chunks = SplitPlanner.chunks(items: items, streamCount: 1)
+        XCTAssertTrue(chunks.allSatisfy { $0.itemNames.count <= SplitPlanner.maxNamesPerChunk })
+        XCTAssertEqual(chunks.reduce(0) { $0 + $1.itemNames.count }, items.count)
     }
 
     /// The reason balancing looks at entry counts at all: two items of equal
@@ -71,40 +59,44 @@ final class SplitPlannerTests: XCTestCase {
         XCTAssertGreaterThan(SplitPlanner.cost(of: dense), SplitPlanner.cost(of: sparse))
     }
 
-    /// The case that motivated weighing entries at all. By bytes these split
-    /// evenly as [big1 + photos] / [big2] — but that first stream also has to
-    /// grind through 20k files, so it finishes long after the second. Weighing
-    /// entries puts the dense tree on a stream of its own instead.
-    func testFileHeavyTreeIsNotPiledOntoAStreamThatLooksLightByBytesAlone() {
-        let items = [
-            SizedItem(name: "big1.iso", sizeKB: 1_500_000, entryCount: 1),
-            SizedItem(name: "big2.iso", sizeKB: 1_500_000, entryCount: 1),
-            SizedItem(name: "photos", sizeKB: 100_000, entryCount: 20_000),
-        ]
-        let plans = SplitPlanner.plan(items: items, streamCount: 2)
-        XCTAssertEqual(plans.count, 2)
-
-        let photosStream = plans.first { $0.itemNames.contains("photos") }!
-        XCTAssertEqual(photosStream.itemNames, ["photos"],
-                       "the file-heavy tree shouldn't also be carrying a multi-GB file")
-
-        // Byte-balanced, that same split would look lopsided (100MB vs 1.5GB);
-        // by work it's close, which is what actually governs finishing time.
-        let costs = plans.map { $0.cost }.sorted()
-        XCTAssertLessThan(Double(costs[1]) / Double(costs[0]), 1.5,
-                          "streams should be roughly balanced by work, got costs \(costs)")
-    }
-
-    func testCostIsReportedPerPlanAndSumsOverItsItems() {
+    func testChunkCostSumsOverItsItemsAndTotalKBStaysARealByteCount() {
         let items = [
             SizedItem(name: "a", sizeKB: 100, entryCount: 3),
             SizedItem(name: "b", sizeKB: 50, entryCount: 2),
         ]
-        let plans = SplitPlanner.plan(items: items, streamCount: 1)
-        XCTAssertEqual(plans.count, 1)
+        let chunks = SplitPlanner.chunks(items: items, streamCount: 1)
         let expected = (100 + 3 * SplitPlanner.perEntryCostKB) + (50 + 2 * SplitPlanner.perEntryCostKB)
-        XCTAssertEqual(plans[0].cost, expected)
-        XCTAssertEqual(plans[0].totalKB, 150, "totalKB should stay a real byte count, not the cost estimate")
+        XCTAssertEqual(chunks.reduce(0) { $0 + $1.cost }, expected)
+        XCTAssertEqual(chunks.reduce(0) { $0 + $1.totalKB }, 150)
+    }
+
+    /// What the queue is for. The cost estimate is a heuristic, so here each
+    /// item's real duration is its estimate times a random factor anywhere
+    /// from 0.3× to 3×. A fixed up-front split can't react to that; streams
+    /// pulling the next chunk as they free up still finish close together.
+    func testStreamsPullingFromTheQueueFinishTogetherDespiteBadEstimates() {
+        var seed: UInt64 = 42
+        func random() -> Double {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return Double(seed >> 11) / Double(1 << 53)
+        }
+        let items = (0..<300).map { SizedItem(name: String(format: "item%03d", $0), sizeKB: Int(random() * 50_000), entryCount: 1 + Int(random() * 400)) }
+        var actualFactor: [String: Double] = [:]
+        for item in items { actualFactor[item.name] = 0.3 + random() * 2.7 }
+
+        let streamCount = 4
+        let queue = ChunkQueue(SplitPlanner.chunks(items: items, streamCount: streamCount))
+        var finishTimes = Array(repeating: 0.0, count: streamCount)
+        // The stream that frees up first takes the next chunk.
+        while let (_, chunk) = queue.take() {
+            let next = finishTimes.indices.min { finishTimes[$0] < finishTimes[$1] }!
+            let names = Set(chunk.itemNames)
+            finishTimes[next] += items.filter { names.contains($0.name) }
+                .reduce(0.0) { $0 + Double(SplitPlanner.cost(of: $1)) * actualFactor[$1.name]! }
+        }
+
+        let spread = (finishTimes.max()! - finishTimes.min()!) / finishTimes.max()!
+        XCTAssertLessThan(spread, 0.05, "streams should finish within ~5% of each other, got \(finishTimes)")
     }
 
     // MARK: - Refining oversized items into their children
@@ -124,36 +116,36 @@ final class SplitPlannerTests: XCTestCase {
         XCTAssertEqual(Set(refined.map { $0.name }),
                        ["huge/part1", "huge/part2", "huge/part3", "huge/part4", "small"])
 
-        // And the resulting split should now actually use all four streams.
-        let plans = SplitPlanner.plan(items: refined, streamCount: 4)
-        XCTAssertEqual(plans.count, 4)
+        // And there should now be enough chunks to keep all four streams busy.
+        XCTAssertGreaterThanOrEqual(SplitPlanner.chunks(items: refined, streamCount: 4).count, 4)
     }
 
-    func testAlreadyBalancedItemsAreLeftAloneWithoutScanning() async {
-        let items = (1...4).map { SizedItem(name: "item\($0)", sizeKB: 1000, entryCount: 10) }
+    func testItemsAlreadySmallerThanAChunkAreLeftAloneWithoutScanning() async {
+        let items = (1...(4 * SplitPlanner.chunksPerStream)).map { SizedItem(name: "item\($0)", sizeKB: 1000, entryCount: 10) }
         var expandCalled = false
         let refined = await SplitPlanner.refine(items: items, streamCount: 4) { _ in
             expandCalled = true
             return []
         }
-        XCTAssertFalse(expandCalled, "nothing exceeds a fair share, so no extra directory scan should run")
-        XCTAssertEqual(refined.count, 4)
+        XCTAssertFalse(expandCalled, "nothing exceeds a chunk, so no extra directory scan should run")
+        XCTAssertEqual(refined.count, 4 * SplitPlanner.chunksPerStream)
     }
 
-    /// Every item becomes an rsync command-line argument, so exploding a
-    /// directory of tens of thousands of entries would blow past ARG_MAX.
-    func testDirectoryWithTooManyChildrenIsLeftIntact() async {
+    /// A flat folder of thousands of files (a dataset, a maildir) is exactly
+    /// what pins one stream when it's left whole. Chunks cap how many names
+    /// go on one command line, so there's no longer a reason to leave it.
+    func testDirectoryWithThousandsOfChildrenIsStillSplit() async {
         let items = [
-            SizedItem(name: "maildir", sizeKB: 900_000, entryCount: 100_000),
+            SizedItem(name: "dataset", sizeKB: 900_000, entryCount: 5001),
             SizedItem(name: "small", sizeKB: 1_000, entryCount: 1),
         ]
-        let refined = await SplitPlanner.refine(items: items, streamCount: 4) { _ in
-            (1...(SplitPlanner.maxChildrenToExpand + 1)).map {
-                SizedItem(name: "maildir/m\($0)", sizeKB: 1, entryCount: 1)
-            }
+        let refined = await SplitPlanner.refine(items: items, streamCount: 4) { parents in
+            guard parents == ["dataset"] else { return [] }
+            return (1...5000).map { SizedItem(name: "dataset/img\($0).jpg", sizeKB: 180, entryCount: 1) }
         }
-        XCTAssertEqual(Set(refined.map { $0.name }), ["maildir", "small"],
-                       "should keep the parent rather than emit thousands of arguments")
+        XCTAssertEqual(refined.count, 5001)
+        let chunks = SplitPlanner.chunks(items: refined, streamCount: 4)
+        XCTAssertGreaterThanOrEqual(chunks.count, 4 * 4)
     }
 
     func testSingleFileItemIsNeverDescendedInto() async {
@@ -195,8 +187,7 @@ final class SplitPlannerTests: XCTestCase {
 
     func testAllItemsAccountedForNoneDroppedOrDuplicated() {
         let items = (0..<37).map { SizedItem(name: "item\($0)", sizeKB: Int.random(in: 1...5000)) }
-        let plans = SplitPlanner.plan(items: items, streamCount: 5)
-        let allNames = plans.flatMap { $0.itemNames }
+        let allNames = SplitPlanner.chunks(items: items, streamCount: 5).flatMap { $0.itemNames }
         XCTAssertEqual(allNames.count, items.count)
         XCTAssertEqual(Set(allNames), Set(items.map { $0.name }))
     }

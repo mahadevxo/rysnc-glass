@@ -121,8 +121,7 @@ final class TransferManagerTests: XCTestCase {
         XCTAssertEqual(Set(allItemNames), Set(items.map { $0.name }))
         XCTAssertEqual(allItemNames.count, items.count)
 
-        let shares = manager.state.streams.map { $0.workShare }
-        XCTAssertEqual(shares.reduce(0, +), 1, accuracy: 0.01, "byte shares across streams should sum to ~1")
+        XCTAssertEqual(manager.state.overallProgress, 1, accuracy: 0.001, "the work streams report should add up to the whole job")
     }
 
     func testSingleStreamWhenStreamCountIsOneEvenWithMultipleFiles() async throws {
@@ -141,7 +140,7 @@ final class TransferManagerTests: XCTestCase {
         await waitForTerminal(manager)
 
         XCTAssertEqual(manager.state.streams.count, 1)
-        XCTAssertEqual(manager.state.streams.first?.workShare, 1)
+        XCTAssertEqual(manager.state.overallProgress, 1, accuracy: 0.001)
         XCTAssertEqual((try? Data(contentsOf: target.appendingPathComponent("f1.txt"))), Data("a".utf8))
         XCTAssertEqual((try? Data(contentsOf: target.appendingPathComponent("f2.txt"))), Data("b".utf8))
     }
@@ -873,5 +872,44 @@ final class TransferManagerTests: XCTestCase {
             XCTAssertEqual(src, dst)
         }
         XCTAssertTrue(TransferManager.active.isEmpty)
+    }
+
+    /// The shape that used to pin one stream: nearly everything in a single
+    /// flat folder of many files. It has to be opened up (one du walk,
+    /// totalled per child) and dealt out so every stream gets a share, and
+    /// it still has to land nested and intact.
+    func testFlatFolderOfManyFilesIsSpreadAcrossEveryStream() async throws {
+        let source = testDir.appendingPathComponent("flat-src")
+        let target = testDir.appendingPathComponent("flat-dst")
+        let dataset = source.appendingPathComponent("dataset")
+        try FileManager.default.createDirectory(at: dataset, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        for n in 0..<600 {
+            try Data(repeating: UInt8(n % 251), count: 2_000 + n * 10).write(to: dataset.appendingPathComponent("img\(n).jpg"))
+        }
+        try Data("x".utf8).write(to: source.appendingPathComponent("readme.txt"))
+
+        let options = RsyncOptions()
+        options.streamCount = 4
+        let manager = TransferManager()
+        manager.start(source: localEndpoint(label: "Source", path: source), target: localEndpoint(label: "Target", path: target), options: options)
+        await waitForTerminal(manager)
+
+        XCTAssertEqual(manager.state.phase, .finished(success: true))
+        XCTAssertEqual(manager.state.streams.count, 4)
+        for stream in manager.state.streams {
+            XCTAssertGreaterThan(stream.itemNames.filter { $0.hasPrefix("dataset/") }.count, 0,
+                                 "stream \(stream.id + 1) should have carried part of the dataset folder")
+        }
+        let taken = manager.state.streams.flatMap { $0.itemNames }
+        XCTAssertEqual(taken.count, Set(taken).count, "no item should be sent twice")
+        XCTAssertEqual(manager.state.overallProgress, 1, accuracy: 0.001)
+
+        for n in [0, 299, 599] {
+            let name = "dataset/img\(n).jpg"
+            XCTAssertEqual(try Data(contentsOf: target.appendingPathComponent(name)), try Data(contentsOf: source.appendingPathComponent(name)))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.appendingPathComponent("img0.jpg").path), "must not be flattened")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: target.appendingPathComponent("dataset").path).count, 600)
     }
 }

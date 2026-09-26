@@ -61,7 +61,7 @@ struct ProgressPanel: View {
     private func streamRow(_ stream: StreamState) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text("Stream \(stream.id + 1)")
+                Text(stream.itemsCompleted > 0 ? "Stream \(stream.id + 1) · \(stream.itemsCompleted) item\(stream.itemsCompleted == 1 ? "" : "s") done" : "Stream \(stream.id + 1)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()

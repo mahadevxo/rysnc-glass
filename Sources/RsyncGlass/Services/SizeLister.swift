@@ -54,11 +54,31 @@ enum SizeLister {
     /// relative to the root) rather than the root's own entries. Names come
     /// back still relative to the root — "photos/2019" — which is exactly the
     /// form rsync -R wants and the form the relay uses as an item name.
+    ///
+    /// One du walk per parent, totalled per child by awk, rather than one du
+    /// per child: a dataset folder holding 50k images would otherwise mean
+    /// 50k du processes. du prints each child's own line — its total, for a
+    /// directory — and a line for everything beneath it, so counting lines
+    /// per child gives its entry count. The parent goes in through the
+    /// environment, since awk -v would mangle backslashes in the name.
     private static func childrenScript(root: String, parents: [String]) -> String {
-        measureScript(root: root, globs: parents.flatMap { parent in
-            // Quote the parent, leave the glob unquoted so the shell expands it.
-            entryGlobs.map { PathUtilities.shellQuote(parent) + "/" + $0 }
-        })
+        """
+        \(duFlagProbe)
+        cd \(PathUtilities.shellQuote(root)) || exit 1
+        for p in \(parents.map(PathUtilities.shellQuote).joined(separator: " ")); do
+          du $A -ak -- "$p" 2>/dev/null | P="$p" awk '
+            BEGIN { p = ENVIRON["P"]; FS = "\\t" }
+            {
+              size = $1; path = substr($0, length($1) + 2)
+              if (path == p) next
+              rest = substr(path, length(p) + 2)
+              i = index(rest, "/"); child = i ? substr(rest, 1, i - 1) : rest
+              n[child]++
+              if (!i) s[child] = size
+            }
+            END { for (c in n) printf "%s\\t%s\\t%s/%s\\n", s[c] + 0, n[c], p, c }'
+        done
+        """
     }
 
     /// Sizes are apparent (bytes in the file), not disk blocks: a 1-byte
@@ -67,11 +87,15 @@ enum SizeLister {
     /// progress measured against it would never reach the end. BSD/macOS du
     /// spells that -A, GNU du --apparent-size; anything else falls back to
     /// block sizes rather than failing the scan.
-    private static func measureScript(root: String, globs: [String]) -> String {
-        """
+    private static let duFlagProbe = """
         if du -A -k /dev/null >/dev/null 2>&1; then A=-A
         elif du --apparent-size -k /dev/null >/dev/null 2>&1; then A=--apparent-size
         else A=; fi
+        """
+
+    private static func measureScript(root: String, globs: [String]) -> String {
+        """
+        \(duFlagProbe)
         cd \(PathUtilities.shellQuote(root)) || exit 1
         for e in \(globs.joined(separator: " ")); do
           [ -e "$e" ] || [ -L "$e" ] || continue

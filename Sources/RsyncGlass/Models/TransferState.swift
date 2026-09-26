@@ -52,20 +52,19 @@ final class LegProgress {
 @Observable
 final class StreamState: Identifiable {
     let id: Int
-    var itemNames: [String] = []
-    var workShare: Double = 0        // fraction of total estimated work this stream is responsible for (0...1), see SplitPlanner.cost
-    var progressFraction: Double = 0 // 0...1, recomputed from this stream's legs as rsync reports progress
+    var itemNames: [String] = []     // every item this stream has taken from the queue so far
+    var progressFraction: Double = 0 // 0...1, progress through the chunk this stream is currently on
     var isRunning: Bool = false
     var exitCode: Int32?
     var currentFile: String = ""
-    var itemsTotal: Int = 0          // remote-to-remote relay: total items assigned to this stream
-    var itemsCompleted: Int = 0      // remote-to-remote relay: items fully relayed (downloaded, uploaded, and deleted from staging)
+    var itemsTotal: Int = 0          // remote-to-remote relay: total items in the whole relay, for the "[i/n]" label
+    var itemsCompleted: Int = 0      // items this stream has finished (for a relay: downloaded, uploaded, and deleted from staging)
     var bytesTransferred: Int64 = 0
     var bytesPerSecond: Double = 0
-
-    /// Sum of the costs of every leg this stream will run. A relay item
-    /// contributes twice — once to download, once to upload.
-    var totalCostKB: Double = 0
+    /// Indexed work this stream has got through, in SplitPlanner.cost units.
+    /// Streams take chunks from a shared queue, so how much each one ends up
+    /// doing isn't known in advance — overall progress sums this instead.
+    var doneCostKB: Double = 0
     /// Kept after they finish, not folded into running totals: rsync's last
     /// progress line can land just after its process exits, and it should
     /// still count.
@@ -89,10 +88,8 @@ final class StreamState: Identifiable {
     }
 
     func recompute() {
-        let done = legs.reduce(0.0) { $0 + ($1.costKB ?? 1) * $1.fraction }
-        if totalCostKB > 0 {
-            progressFraction = min(max(done / totalCostKB, progressFraction), 1)
-        }
+        doneCostKB = legs.reduce(0.0) { $0 + ($1.costKB ?? 1) * $1.fraction }
+        progressFraction = legs.last?.fraction ?? 0
         bytesTransferred = legs.reduce(0) { $0 + $1.bytes }
     }
 }
@@ -125,6 +122,9 @@ final class TransferState {
     var streams: [StreamState] = []
     var logLines: [String] = []
     var statusMessage: String = ""
+    /// All the work in this job, in the same units as StreamState.doneCostKB.
+    /// A relay counts each item twice: once down, once up.
+    var totalCostKB: Double = 0
 
     var startedAt: Date?
     var finishedAt: Date?
@@ -136,8 +136,8 @@ final class TransferState {
     var now = Date()
 
     var overallProgress: Double {
-        guard !streams.isEmpty else { return 0 }
-        return min(streams.reduce(0.0) { $0 + $1.progressFraction * $1.workShare }, 1)
+        guard totalCostKB > 0 else { return 0 }
+        return min(streams.reduce(0.0) { $0 + $1.doneCostKB } / totalCostKB, 1)
     }
 
     var bytesTransferred: Int64 {
@@ -161,6 +161,7 @@ final class TransferState {
         streams = []
         logLines = []
         statusMessage = ""
+        totalCostKB = 0
         startedAt = nil
         finishedAt = nil
         bytesPerSecond = 0

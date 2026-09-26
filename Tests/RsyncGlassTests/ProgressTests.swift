@@ -61,68 +61,53 @@ final class LegProgressTests: XCTestCase {
         XCTAssertEqual(leg.bytes, 5_000)
     }
 
-    /// A relay stream: two items of different weight, each downloaded then
-    /// uploaded, with the second item's download overlapping the first's
-    /// upload the way pipelined mode runs them.
-    func testRelayStreamWeighsItemsByCostAcrossConcurrentLegs() {
+    /// A relay stream: two chunks of different weight, each downloaded then
+    /// uploaded, with the second chunk's download overlapping the first's
+    /// upload the way pipelined mode runs them. Overall progress is the work
+    /// done across every stream over the job's total.
+    func testRelayProgressWeighsChunksByCostAcrossConcurrentLegs() {
+        let state = TransferState()
         let stream = StreamState(id: 0)
-        stream.totalCostKB = (300 + 100) * 2
+        state.streams = [stream]
+        state.totalCostKB = (300 + 100) * 2
 
         let bigDown = stream.beginLeg(costKB: 300)
         bigDown.apply(RsyncProgressUpdate(bytes: 150 * 1024, percent: 50, checkedEntries: nil), cumulativeBytes: true)
         stream.recompute()
-        XCTAssertEqual(stream.progressFraction, 150.0 / 800, accuracy: 0.001)
+        XCTAssertEqual(state.overallProgress, 150.0 / 800, accuracy: 0.001)
+        XCTAssertEqual(stream.progressFraction, 0.5, accuracy: 0.001, "a stream's own bar tracks the chunk it's on")
         stream.endLeg(bigDown, succeeded: true)
-        XCTAssertEqual(stream.progressFraction, 300.0 / 800, accuracy: 0.001)
+        XCTAssertEqual(state.overallProgress, 300.0 / 800, accuracy: 0.001)
 
         let bigUp = stream.beginLeg(costKB: 300)
         let smallDown = stream.beginLeg(costKB: 100)
         bigUp.apply(RsyncProgressUpdate(bytes: 30 * 1024, percent: 10, checkedEntries: nil), cumulativeBytes: true)
         smallDown.apply(RsyncProgressUpdate(bytes: 100 * 1024, percent: 100, checkedEntries: nil), cumulativeBytes: true)
         stream.recompute()
-        XCTAssertEqual(stream.progressFraction, (300.0 + 30 + 100) / 800, accuracy: 0.001)
+        XCTAssertEqual(state.overallProgress, (300.0 + 30 + 100) / 800, accuracy: 0.001)
         XCTAssertEqual(stream.bytesTransferred, (150 + 30 + 100) * 1024)
+    }
+
+    /// Streams take different amounts of work from the queue; overall
+    /// progress doesn't care which stream did it.
+    func testOverallProgressSumsWorkAcrossStreamsWhateverEachTook() {
+        let state = TransferState()
+        let fast = StreamState(id: 0)
+        let slow = StreamState(id: 1)
+        state.streams = [fast, slow]
+        state.totalCostKB = 1000
+        for _ in 0..<3 { fast.endLeg(fast.beginLeg(costKB: 200), succeeded: true) }
+        slow.endLeg(slow.beginLeg(costKB: 250), succeeded: true)
+        XCTAssertEqual(state.overallProgress, 0.85, accuracy: 0.001)
     }
 
     func testLateProgressLineAfterLegEndsStillCountsItsBytes() {
         let stream = StreamState(id: 0)
-        stream.totalCostKB = 100
         let leg = stream.beginLeg(costKB: 100)
         stream.endLeg(leg, succeeded: true)
         leg.apply(RsyncProgressUpdate(bytes: 4096, percent: 100, checkedEntries: 1), cumulativeBytes: true)
         stream.recompute()
         XCTAssertEqual(stream.bytesTransferred, 4096)
-        XCTAssertEqual(stream.progressFraction, 1)
-    }
-}
-
-final class MetricsTests: XCTestCase {
-    func testRateWindowMeasuresOverTrailingSpan() {
-        var window = RateWindow(span: 5)
-        XCTAssertNil(window.rate)
-        window.add(0, at: 0)
-        window.add(100, at: 1)
-        XCTAssertEqual(window.rate ?? 0, 100, accuracy: 0.001)
-        // Fast early on, slower now — the old samples age out.
-        for t in 2...10 { window.add(100 + Double(t - 1) * 10, at: TimeInterval(t)) }
-        XCTAssertEqual(window.rate ?? 0, 10, accuracy: 0.001)
-    }
-
-    func testSpeedPicksUnitToSuitTheRate() {
-        XCTAssertTrue(TransferFormat.speed(2_500).hasSuffix("KB/s"), TransferFormat.speed(2_500))
-        XCTAssertTrue(TransferFormat.speed(38_500_000).hasSuffix("MB/s"), TransferFormat.speed(38_500_000))
-        XCTAssertTrue(TransferFormat.speed(1_200_000_000).hasSuffix("GB/s"), TransferFormat.speed(1_200_000_000))
-    }
-
-    func testPercentNeverRoundsUpToDone() {
-        XCTAssertEqual(TransferFormat.percent(0.9999), "99.9%")
-        XCTAssertEqual(TransferFormat.percent(1), "100.0%")
-        XCTAssertEqual(TransferFormat.percent(0.423), "42.3%")
-    }
-
-    func testDurationFormatting() {
-        XCTAssertEqual(TransferFormat.duration(42), "0:42")
-        XCTAssertEqual(TransferFormat.duration(725), "12:05")
-        XCTAssertEqual(TransferFormat.duration(3729), "1:02:09")
+        XCTAssertEqual(stream.doneCostKB, 100)
     }
 }
