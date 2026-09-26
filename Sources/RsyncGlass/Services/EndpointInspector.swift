@@ -32,4 +32,18 @@ enum EndpointInspector {
             return isDir.boolValue
         }
     }
+
+    /// Size in bytes if the endpoint's path is a regular file, nil if it's
+    /// a directory. Only needed for remote sources.
+    static func fileSize(_ endpoint: Endpoint) async throws -> Int64? {
+        let quoted = PathUtilities.shellQuote(endpoint.path)
+        if endpoint.isRemote {
+            let process = try SSHConnectionBuilder.makeProcess(for: endpoint, remoteCommand: "if [ -f \(quoted) ]; then wc -c < \(quoted); fi")
+            let result = try await ProcessRunner.run(process)
+            return Int64(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: endpoint.localPath)
+        guard attributes[.type] as? FileAttributeType == .typeRegular else { return nil }
+        return (attributes[.size] as? NSNumber)?.int64Value
+    }
 }

@@ -29,10 +29,10 @@ enum RsyncCommandBuilder {
         guard let rsyncPath = CommandLocator.rsync else { throw RsyncCommandBuilderError.missingRsync }
         guard !(source.isRemote && target.isRemote) else { throw RsyncCommandBuilderError.bothEndpointsRemote }
 
-        var args = options.baseFlags()
+        let remoteEndpoint: Endpoint? = source.isRemote ? source : (target.isRemote ? target : nil)
+        var args = options.baseFlags(onLocalNetwork: options.isLocalNetwork(host: remoteEndpoint?.host))
         args.append(RsyncCapabilities.supportsInfoProgress2 ? "--info=progress2" : "--progress")
 
-        let remoteEndpoint: Endpoint? = source.isRemote ? source : (target.isRemote ? target : nil)
         if let remoteEndpoint {
             if RsyncCapabilities.supportsProtectArgs {
                 args.append("-s")

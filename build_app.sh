@@ -116,6 +116,37 @@ bundle_binary() {
 bundle_binary rsync
 bundle_binary sshpass
 
+# rclone: the official release, pinned by version and checksum rather than
+# whatever happens to be installed here. It's a single static Go binary, so
+# there are no dylibs to chase. Cached between builds; if it can't be fetched
+# the build carries on without it and the app falls back to a system rclone.
+RCLONE_VERSION="v1.75.1"
+RCLONE_SHA256="c61d7a371c62bcbbe882c3423aa4b8bf63485c248dd0f692997b8f0c3f6d0c6f"  # rclone-v1.75.1-osx-arm64.zip
+bundle_rclone() {
+    local cache="$HOME/Library/Caches/RsyncGlass-build"
+    local zip="$cache/rclone-${RCLONE_VERSION}-osx-arm64.zip"
+    mkdir -p "$cache"
+    if [[ ! -f "$zip" ]] || [[ "$(shasum -a 256 "$zip" | awk '{print $1}')" != "${RCLONE_SHA256}" ]]; then
+        echo "Downloading rclone ${RCLONE_VERSION}…"
+        if ! curl -fsSL -o "$zip.part" "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-osx-arm64.zip"; then
+            rm -f "$zip.part"
+            echo "warning: couldn't download rclone — app will rely on a system install at runtime" >&2
+            return
+        fi
+        mv "$zip.part" "$zip"
+    fi
+    if [[ "$(shasum -a 256 "$zip" | awk '{print $1}')" != "${RCLONE_SHA256}" ]]; then
+        rm -f "$zip"
+        echo "error: rclone download doesn't match the pinned checksum — refusing to bundle it." >&2
+        exit 1
+    fi
+    unzip -q -o -j "$zip" "rclone-${RCLONE_VERSION}-osx-arm64/rclone" -d "$BUILD_DIR"
+    mv "$BUILD_DIR/rclone" "$APP/Contents/Resources/bin/rclone"
+    chmod 755 "$APP/Contents/Resources/bin/rclone"
+    echo "Bundled rclone ${RCLONE_VERSION}"
+}
+bundle_rclone
+
 echo "Codesigning (ad-hoc)…"
 # Sign bundled binaries and dylibs individually first: they sit under
 # Resources, not one of the standard Frameworks/PlugIns spots --deep walks,

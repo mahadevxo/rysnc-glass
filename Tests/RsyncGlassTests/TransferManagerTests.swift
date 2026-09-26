@@ -161,7 +161,7 @@ final class TransferManagerTests: XCTestCase {
         // Repeated-byte content compresses to almost nothing, which would let
         // a compressed transfer race past --bwlimit's throttling (measured in
         // wire bytes) before we get a chance to cancel — so turn -z off here.
-        options.compress = false
+        options.network = .localNetwork
         options.bandwidthLimitKBps = "2000" // ~2MB/s, so 20MB takes ~10s — enough time to cancel mid-flight
 
         let manager = TransferManager()
@@ -249,7 +249,7 @@ final class TransferManagerTests: XCTestCase {
 
         let options = RsyncOptions()
         options.streamCount = 1
-        options.compress = false
+        options.network = .localNetwork
         options.bandwidthLimitKBps = "2000"
 
         let manager = TransferManager()
@@ -291,7 +291,7 @@ final class TransferManagerTests: XCTestCase {
 
         let options = RsyncOptions()
         options.streamCount = 1
-        options.compress = false
+        options.network = .localNetwork
         options.bandwidthLimitKBps = "2000"
 
         let manager = TransferManager()
@@ -486,7 +486,7 @@ final class TransferManagerTests: XCTestCase {
 
         let options = RsyncOptions()
         options.streamCount = 1
-        options.compress = false // repeated-byte content would defeat --bwlimit's throttling otherwise
+        options.network = .localNetwork // repeated-byte content would defeat --bwlimit's throttling otherwise
         options.bandwidthLimitKBps = "1500" // ~1.5MB/s, so each leg of each item takes ~1s
 
         let manager = TransferManager()
@@ -545,7 +545,7 @@ final class TransferManagerTests: XCTestCase {
         let streamCount = 3
         let options = RsyncOptions()
         options.streamCount = streamCount
-        options.compress = false
+        options.network = .localNetwork
         options.bandwidthLimitKBps = "1500" // ~1s per leg, so polling can see staging mid-flight
 
         let manager = TransferManager()
@@ -608,7 +608,7 @@ final class TransferManagerTests: XCTestCase {
 
         let options = RsyncOptions()
         options.streamCount = 1
-        options.compress = false
+        options.network = .localNetwork
         options.bandwidthLimitKBps = "1500"
         options.pipelineRelayLegs = true
 
@@ -797,8 +797,11 @@ final class TransferManagerTests: XCTestCase {
         target.remotePath = "/tmp/y"
         target.authMethod = .key
 
+        let options = RsyncOptions()
+        options.directServerToServer = false
+        options.remoteFallback = .rsyncRelay
         let manager = TransferManager()
-        manager.start(source: source, target: target, options: RsyncOptions())
+        manager.start(source: source, target: target, options: options)
         await waitForTerminal(manager, timeout: 15)
 
         guard case .finished(let success) = manager.state.phase else {
@@ -807,6 +810,35 @@ final class TransferManagerTests: XCTestCase {
         }
         XCTAssertFalse(success, "an unreachable relay leg should fail, not silently succeed")
         XCTAssertTrue(manager.state.logLines.contains { $0.contains("relaying through a local staging folder") })
+    }
+
+    /// The default route: try direct, fall back to streaming with rclone.
+    /// With nothing listening, each step should fail with a reason in the
+    /// log and hand on to the next, and the job should end failed — not hang.
+    func testRemoteToRemoteTriesDirectThenFallsBackToRcloneWithReasons() async throws {
+        try XCTSkipIf(CommandLocator.rclone == nil, "rclone isn't installed")
+        let source = Endpoint(label: "Source")
+        source.kind = .remote
+        source.host = "127.0.0.1"
+        source.port = "2"
+        source.username = "nobody"
+        source.remotePath = "/tmp/x"
+        let target = Endpoint(label: "Target")
+        target.kind = .remote
+        target.host = "127.0.0.1"
+        target.port = "3"
+        target.username = "nobody"
+        target.remotePath = "/tmp/y"
+
+        let manager = TransferManager()
+        manager.start(source: source, target: target, options: RsyncOptions())
+        await waitForTerminal(manager, timeout: 30)
+
+        XCTAssertEqual(manager.state.phase, .finished(success: false))
+        let log = manager.state.logLines.joined(separator: "\n")
+        XCTAssertTrue(log.contains("Can't transfer server-to-server directly"), log)
+        XCTAssertTrue(log.contains("Streaming server-to-server with rclone"), log)
+        XCTAssertTrue(manager.state.statusMessage.contains("Couldn't connect to 127.0.0.1"), manager.state.statusMessage)
     }
 
     // MARK: - Independent windows and live metrics
@@ -832,7 +864,7 @@ final class TransferManagerTests: XCTestCase {
             targets.append(target)
 
             let options = RsyncOptions()
-            options.compress = false
+            options.network = .localNetwork
             options.bandwidthLimitKBps = "400"
             let manager = TransferManager()
             manager.start(source: localEndpoint(label: "Source", path: source), target: localEndpoint(label: "Target", path: target), options: options)

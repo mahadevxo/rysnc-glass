@@ -11,19 +11,29 @@ struct OptionsPanel: View {
 
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
                 GridRow {
-                    Toggle("Compression", isOn: $options.compress)
                     Toggle("Archive mode", isOn: $options.archive)
-                }
-                GridRow {
                     Toggle("Delete extraneous files on target", isOn: $options.delete)
-                    Toggle("Dry run (preview only)", isOn: $options.dryRun)
                 }
                 GridRow {
+                    Toggle("Dry run (preview only)", isOn: $options.dryRun)
                     Toggle("Verbose logging", isOn: $options.verbose)
+                }
+                GridRow {
                     Toggle("Resume interrupted transfers", isOn: $options.resumePartial)
                 }
             }
             .toggleStyle(.switch)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Picker("Network", selection: $options.network) {
+                    ForEach(NetworkProfile.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 420)
+                Text(networkCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             HStack {
                 Text("Bandwidth limit")
@@ -62,17 +72,51 @@ struct OptionsPanel: View {
 
             if isRemoteToRemote {
                 VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Overlap upload with next download (relay)", isOn: $options.pipelineRelayLegs)
+                    Toggle("Transfer server-to-server directly when possible", isOn: $options.directServerToServer)
                         .toggleStyle(.switch)
-                    Text(options.pipelineRelayLegs
-                         ? "Faster — while one item uploads to the target, the next item is already downloading. Uses roughly double the local disk per stream at any moment."
-                         : "One item at a time per stream: fully downloaded, then uploaded, then deleted from local staging before starting the next. Lowest disk use — lets a transfer larger than this Mac's free space complete.")
+                    Text(options.directServerToServer
+                         ? "The source server sends straight to the target, so the data never passes through this Mac. It logs in to the target with your key through a temporary forwarded agent, for this transfer only. If it can't reach the target, the transfer is routed through this Mac instead."
+                         : "Always route the data through this Mac.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Through this Mac", selection: $options.remoteFallback) {
+                        ForEach(RemoteFallback.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 420)
+                    Text(options.remoteFallback == .rcloneStream
+                         ? "Streams through this Mac's memory with nothing staged on disk. Changed files are sent whole, and permissions and ownership aren't carried over."
+                         : "rsync keeps permissions and ownership and sends only the changed parts of files, but each item is staged on this Mac's disk on the way.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if options.remoteFallback == .rsyncRelay {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Overlap upload with next download (relay)", isOn: $options.pipelineRelayLegs)
+                            .toggleStyle(.switch)
+                        Text(options.pipelineRelayLegs
+                             ? "Faster — while one item uploads to the target, the next item is already downloading. Uses roughly double the local disk per stream at any moment."
+                             : "One item at a time per stream: fully downloaded, then uploaded, then deleted from local staging before starting the next. Lowest disk use — lets a transfer larger than this Mac's free space complete.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassPanel()
+    }
+
+    private var networkCaption: String {
+        switch options.network {
+        case .automatic:
+            return "Picks per host: private addresses (192.168.x, 10.x, .local…) get local-network tuning, everything else internet tuning."
+        case .localNetwork:
+            return "No compression — on a fast link it costs more CPU time than the bandwidth it saves, especially for photos, video and archives."
+        case .internet:
+            return "Compresses data in transit, to make the most of a slower link."
+        }
     }
 }

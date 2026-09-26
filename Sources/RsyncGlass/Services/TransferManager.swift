@@ -19,6 +19,16 @@ final class TransferManager {
     /// isTransferActive is released by cancel() immediately and so says
     /// nothing about whether rsync has actually exited yet.
     private(set) var jobTask: Task<Void, Never>?
+    /// Whether rsync's byte counts are running totals for the whole process
+    /// (--info=progress2) or per file (--progress). Depends on which rsync
+    /// is doing the sending, which for a direct server-to-server job is the
+    /// one on the source server, not this Mac's.
+    private var progressIsCumulative = RsyncCapabilities.supportsInfoProgress2
+
+    /// Builds the rsync process for a set of item names (nil: the whole
+    /// source path), so the same planning and queueing drives rsync run
+    /// here or on a remote server.
+    typealias ProcessFactory = (_ itemNames: [String]?, _ sourceIsDirectory: Bool) throws -> Process
 
     var isTransferActive: Bool { jobInFlight }
 
@@ -156,10 +166,6 @@ final class TransferManager {
         state.phase = .planning
         state.statusMessage = "Checking dependencies…"
 
-        if CommandLocator.rsync == nil {
-            fail("rsync not found on this Mac. Install it with: brew install rsync", generation: generation)
-            return
-        }
         if (source.isRemote || target.isRemote) && CommandLocator.ssh == nil {
             fail("ssh not found on this Mac.", generation: generation)
             return
@@ -169,11 +175,171 @@ final class TransferManager {
             return
         }
 
+        if source.isCloud || target.isCloud {
+            state.appendLog("Cloud storage: transferring with rclone.")
+            finalize(outcome: await runRclone(source: source, target: target, options: options), generation: generation)
+            return
+        }
+
+        if CommandLocator.rsync == nil {
+            fail("rsync not found on this Mac. Install it with: brew install rsync", generation: generation)
+            return
+        }
+        progressIsCumulative = RsyncCapabilities.supportsInfoProgress2
+
         if source.isRemote && target.isRemote {
+            if options.directServerToServer, await runDirect(source: source, target: target, options: options, generation: generation) {
+                return
+            }
+            if isCancelled { return }
+            if options.remoteFallback == .rcloneStream {
+                if CommandLocator.rclone != nil {
+                    state.appendLog("Streaming server-to-server with rclone through this Mac's memory, so nothing is staged on its disk. rclone sends changed files whole and doesn't carry over permissions or ownership.")
+                    finalize(outcome: await runRclone(source: source, target: target, options: options), generation: generation)
+                    return
+                }
+                state.appendLog("rclone isn't available, so relaying with rsync through local staging instead.")
+            }
+            logNetworkTuning(options, hosts: [source.host, target.host])
             await runRelay(source: source, target: target, options: options, generation: generation)
         } else {
+            if let streams = await parallelDownloadStreams(source: source, target: target, options: options) {
+                state.appendLog("Large single file: downloading it as \(streams) parallel pieces with rclone. rsync can only fetch a file as one stream.")
+                finalize(outcome: await runRclone(source: source, target: target, options: options, multiThreadStreams: streams), generation: generation)
+                return
+            }
+            if isCancelled { return }
+            logNetworkTuning(options, hosts: [source, target].filter(\.isRemote).map(\.host))
             let outcome = await runLeg(source: source, target: target, options: options, generation: generation)
             finalize(outcome: outcome, generation: generation)
+        }
+    }
+
+    /// Files at least this big are worth downloading as parallel pieces.
+    static let parallelDownloadThreshold: Int64 = 1 << 30
+
+    /// How many pieces to download the source in, or nil to leave it to
+    /// rsync. Only for one large file coming down from a server, and only
+    /// when there's no copy of it on this Mac yet: a partial copy means an
+    /// interrupted download that rsync --partial can resume, where rclone
+    /// would start the file over.
+    private func parallelDownloadStreams(source: Endpoint, target: Endpoint, options: RsyncOptions) async -> Int? {
+        guard source.isRemote, target.kind == .local, options.streamCount > 1, !options.dryRun,
+              CommandLocator.rclone != nil else { return nil }
+        state.statusMessage = "Inspecting source…"
+        guard let size = try? await EndpointInspector.fileSize(source), size >= Self.parallelDownloadThreshold else { return nil }
+        let landing = PathUtilities.join(target.localPath, (source.remotePath as NSString).lastPathComponent)
+        guard !FileManager.default.fileExists(atPath: landing) else {
+            state.appendLog("A copy of this file is already on this Mac, so rsync will resume it rather than download it again in parallel pieces.")
+            return nil
+        }
+        return options.streamCount
+    }
+
+    /// Runs the whole transfer as one rclone process, which does its own
+    /// parallelism (--transfers, --multi-thread-streams).
+    private func runRclone(source: Endpoint, target: Endpoint, options: RsyncOptions, multiThreadStreams: Int? = nil) async -> LegOutcome {
+        guard CommandLocator.rclone != nil else { return .failure(RcloneEngine.EngineError.missing.localizedDescription) }
+
+        // Log in to each server with ssh first. It fails fast with ssh's own
+        // error message if the login doesn't work, and it records a new
+        // server's host key (accept-new), which rclone then checks against.
+        let agent = PrivateAgent()
+        defer { agent.stop() }
+        var useLoginAgent = false
+        for endpoint in [source, target] where endpoint.isRemote {
+            state.statusMessage = "Connecting to \(endpoint.host)…"
+            do {
+                let check = try SSHConnectionBuilder.makeProcess(for: endpoint, remoteCommand: "true")
+                let result = try await ProcessRunner.run(check, onStart: registerProcess)
+                if isCancelled { return .cancelled }
+                guard result.exitCode == 0 else {
+                    let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return .failure("Couldn't connect to \(endpoint.host)\(detail.isEmpty ? "" : ": \(detail)")")
+                }
+            } catch {
+                return .failure("Couldn't connect to \(endpoint.host): \(error.localizedDescription)")
+            }
+            guard endpoint.authMethod == .key, !useLoginAgent else { continue }
+            do {
+                try await agent.start()
+                try await agent.addKey(for: endpoint)
+            } catch {
+                // ssh logged in, so the key is somewhere ssh can find it —
+                // most likely already in the login agent, which rclone can
+                // use directly.
+                useLoginAgent = true
+            }
+        }
+
+        let sourceIsDirectory: Bool
+        if source.isCloud {
+            sourceIsDirectory = true  // only decides copy vs sync; rclone handles a file either way
+        } else {
+            do {
+                sourceIsDirectory = try await EndpointInspector.isDirectory(source)
+            } catch {
+                return .failure("Couldn't inspect source path: \(error.localizedDescription)")
+            }
+        }
+        if isCancelled { return .cancelled }
+
+        let process: Process
+        do {
+            process = try await RcloneEngine.buildProcess(
+                source: source, target: target, sourceIsDirectory: sourceIsDirectory, options: options,
+                agentSocket: useLoginAgent ? nil : agent.socket, multiThreadStreams: multiThreadStreams
+            )
+        } catch {
+            return .failure(error.localizedDescription)
+        }
+
+        let streamState = StreamState(id: 0)
+        state.streams = [streamState]
+        state.totalCostKB = 1  // rclone reports its own overall fraction
+        state.phase = .running
+        state.statusMessage = "Transferring with rclone…"
+        guard await register(process) else { return .cancelled }
+        await runStream(process: process, streamState: streamState, legCostKB: nil)
+        runningProcesses = []
+        if isCancelled { return .cancelled }
+        return streamState.exitCode == 0 ? .success : .failure(nil)
+    }
+
+    /// Tries a direct server-to-server transfer. Returns false, having
+    /// logged why, if the path isn't available — the caller then routes the
+    /// data through this Mac instead.
+    private func runDirect(source: Endpoint, target: Endpoint, options: RsyncOptions, generation: Int) async -> Bool {
+        state.statusMessage = "Checking whether \(source.host) can reach \(target.host) directly…"
+        let direct = ServerToServer(source: source, target: target)
+        defer { direct.stop() }
+        do {
+            try await direct.prepare(onStart: registerProcess)
+        } catch {
+            if !isCancelled {
+                state.appendLog("Can't transfer server-to-server directly: \(error.localizedDescription). Routing the data through this Mac instead.")
+            }
+            return false
+        }
+        if isCancelled { return true }
+
+        state.appendLog("Direct server-to-server: \(source.host) sends straight to \(target.host), so the data never passes through this Mac. \(source.host) logs in to \(target.host) using your key through a temporary forwarded agent, for this transfer only.")
+        logNetworkTuning(options, hosts: [target.host])
+        progressIsCumulative = direct.capabilities?.supportsInfoProgress2 ?? false
+        let outcome = await runLeg(source: source, target: target, options: options, generation: generation) { itemNames, sourceIsDirectory in
+            try direct.buildProcess(itemNames: itemNames, sourceIsDirectory: sourceIsDirectory, options: options)
+        }
+        finalize(outcome: outcome, generation: generation)
+        return true
+    }
+
+    private func logNetworkTuning(_ options: RsyncOptions, hosts: [String]) {
+        for host in hosts {
+            let local = options.isLocalNetwork(host: host)
+            let reason = options.network == .automatic
+                ? (local ? "\(host) is on the local network" : "\(host) looks to be over the internet")
+                : "Network set to \(options.network.rawValue.lowercased())"
+            state.appendLog("\(reason) — compression \(local ? "off" : "on").")
         }
     }
 
@@ -561,7 +727,10 @@ final class TransferManager {
     /// Runs one source→target rsync leg (splitting into parallel streams if
     /// requested) and reports how it ended. Does not set a terminal phase —
     /// callers decide that, since a relay has a second leg to run after this one.
-    private func runLeg(source: Endpoint, target: Endpoint, options: RsyncOptions, generation: Int) async -> LegOutcome {
+    private func runLeg(source: Endpoint, target: Endpoint, options: RsyncOptions, generation: Int, makeProcess: ProcessFactory? = nil) async -> LegOutcome {
+        let makeProcess = makeProcess ?? { itemNames, sourceIsDirectory in
+            try RsyncCommandBuilder.buildProcess(source: source, target: target, itemNames: itemNames, sourceIsDirectory: sourceIsDirectory, options: options)
+        }
         state.statusMessage = "Inspecting source…"
         let sourceIsDirectory: Bool
         do {
@@ -621,10 +790,7 @@ final class TransferManager {
             state.totalCostKB = costKB ?? 1
             let process: Process
             do {
-                process = try RsyncCommandBuilder.buildProcess(
-                    source: source, target: target, itemNames: nil,
-                    sourceIsDirectory: sourceIsDirectory, options: options
-                )
+                process = try makeProcess(nil, sourceIsDirectory)
             } catch {
                 fail("Couldn't build rsync command: \(error.localizedDescription)", generation: generation)
                 return .failure(nil)
@@ -649,7 +815,7 @@ final class TransferManager {
         await withTaskGroup(of: Void.self) { group in
             for streamState in streams {
                 group.addTask { [weak self] in
-                    await self?.runChunks(from: queue, streamState: streamState, source: source, target: target, sourceIsDirectory: sourceIsDirectory, options: options)
+                    await self?.runChunks(from: queue, streamState: streamState, sourceIsDirectory: sourceIsDirectory, makeProcess: makeProcess)
                 }
             }
         }
@@ -667,7 +833,7 @@ final class TransferManager {
     /// Stops at the first failed chunk and leaves the rest to the other
     /// streams — a failure that's about this source or target, like a full
     /// disk, would only fail every remaining chunk the same way.
-    private func runChunks(from queue: ChunkQueue, streamState: StreamState, source: Endpoint, target: Endpoint, sourceIsDirectory: Bool, options: RsyncOptions) async {
+    private func runChunks(from queue: ChunkQueue, streamState: StreamState, sourceIsDirectory: Bool, makeProcess: ProcessFactory) async {
         await MainActor.run {
             streamState.isRunning = true
             streamState.exitCode = 0
@@ -679,10 +845,7 @@ final class TransferManager {
             }
             let process: Process
             do {
-                process = try RsyncCommandBuilder.buildProcess(
-                    source: source, target: target, itemNames: chunk.itemNames,
-                    sourceIsDirectory: sourceIsDirectory, options: options
-                )
+                process = try makeProcess(chunk.itemNames, sourceIsDirectory)
             } catch {
                 state.appendLog("Couldn't build rsync command for chunk \(index): \(error.localizedDescription)")
                 await MainActor.run { streamState.exitCode = -1 }
@@ -771,17 +934,21 @@ final class TransferManager {
             }
         }
 
+        // Split on isNewline rather than "\n" or "\r": it covers both (rsync
+        // redraws progress with a bare "\r"), and also "\r\n", which ssh ends
+        // its warnings with and Swift treats as a single Character matching
+        // neither — so a warning would otherwise swallow the line after it.
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+            for line in text.split(whereSeparator: \.isNewline) {
                 onLine(String(line))
             }
         }
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+            for line in text.split(whereSeparator: \.isNewline) {
                 onLine("⚠︎ " + line)
             }
         }
@@ -825,6 +992,24 @@ final class TransferManager {
         // the displayed state, so drop their output rather than logging it
         // against — or worse, writing progress into — whatever runs now.
         guard state.streams.contains(where: { $0 === streamState }) else { return }
+
+        // rclone logs JSON to stderr, which arrives here marked as a warning.
+        let unmarked = trimmed.hasPrefix("⚠︎") ? String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces) : trimmed
+        if let rclone = RcloneLogLine.parse(unmarked) {
+            switch rclone {
+            case .stats(let bytes, let fraction):
+                leg.apply(fraction: fraction, bytes: bytes)
+                streamState.recompute()
+            case .message(let level, let text, let object):
+                if let object { streamState.currentFile = object }
+                if !text.isEmpty {
+                    let marker = level == "error" || level == "critical" ? "⚠︎ " : ""
+                    state.appendLog("[rclone] \(marker)\(object.map { "\($0): " } ?? "")\(text)")
+                }
+            }
+            return
+        }
+
         state.appendLog("[Stream \(streamState.id + 1)] \(trimmed)")
 
         // Progress goes to this process's own leg, not straight into the
@@ -832,7 +1017,7 @@ final class TransferManager {
         // when pipelined), each restarting near 0%, and the stream's figure
         // is the cost-weighted sum over all of them.
         if let update = RsyncProgressParser.parse(trimmed) {
-            leg.apply(update, cumulativeBytes: RsyncCapabilities.supportsInfoProgress2)
+            leg.apply(update, cumulativeBytes: progressIsCumulative)
             streamState.recompute()
             return
         }

@@ -54,7 +54,9 @@ enum SSHConnectionBuilder {
     }
 
     /// A ready-to-run Process that executes `remoteCommand` on the endpoint's host via ssh.
-    static func makeProcess(for endpoint: Endpoint, remoteCommand: String) throws -> Process {
+    /// - forwardingAgent: an ssh-agent socket to forward to the host, so a
+    ///   command running there can log in onward with the keys it holds.
+    static func makeProcess(for endpoint: Endpoint, remoteCommand: String, forwardingAgent agentSocket: String? = nil) throws -> Process {
         guard let ssh = CommandLocator.ssh else { throw SSHConnectionError.missingSSH }
 
         let process = Process()
@@ -67,6 +69,11 @@ enum SSHConnectionBuilder {
             executable = sshpass
             arguments = ["-e", ssh] + arguments
             environment["SSHPASS"] = endpoint.password
+        }
+
+        if let agentSocket {
+            arguments.append(contentsOf: ["-o", "ForwardAgent=yes"])
+            environment["SSH_AUTH_SOCK"] = agentSocket
         }
 
         arguments.append("\(endpoint.username)@\(endpoint.host)")

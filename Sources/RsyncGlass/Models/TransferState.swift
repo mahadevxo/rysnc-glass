@@ -47,6 +47,12 @@ final class LegProgress {
         // the last.
         fraction = max(fraction, min(next, 1))
     }
+
+    /// For engines that report their own overall fraction (rclone).
+    func apply(fraction newFraction: Double, bytes newBytes: Int64) {
+        bytes = max(bytes, newBytes)
+        fraction = max(fraction, min(newFraction, 1))
+    }
 }
 
 @Observable

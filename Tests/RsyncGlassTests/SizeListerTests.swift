@@ -153,4 +153,24 @@ final class SizeListerTests: XCTestCase {
         let items = try await SizeLister.list(for: endpoint)
         XCTAssertEqual(Set(items.map { $0.name }), [".hidden", "visible.txt"])
     }
+
+    /// A folder with thousands of entries produces more listing output than
+    /// a pipe holds. Reading it only after the scan exited deadlocked: the
+    /// scan blocked writing, and never exited.
+    func testListingChildrenOfAFolderWithThousandsOfEntriesDoesNotHang() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SizeListerBig-\(UUID().uuidString)")
+        let big = root.appendingPathComponent("big")
+        try FileManager.default.createDirectory(at: big, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for n in 0..<5000 {
+            FileManager.default.createFile(atPath: big.appendingPathComponent("a-fairly-long-file-name-\(n).dat").path, contents: Data([1]))
+        }
+        let endpoint = Endpoint(label: "Source")
+        endpoint.kind = .local
+        endpoint.localPath = root.path
+
+        let children = await SizeLister.listChildren(of: ["big"], in: endpoint)
+        XCTAssertEqual(children.count, 5000)
+        XCTAssertTrue(children.allSatisfy { $0.name.hasPrefix("big/a-fairly-long-file-name-") && $0.entryCount == 1 })
+    }
 }

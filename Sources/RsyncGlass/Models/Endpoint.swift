@@ -3,6 +3,7 @@ import Foundation
 enum EndpointKind: String, CaseIterable, Identifiable {
     case local = "Local"
     case remote = "Remote (SSH)"
+    case cloud = "Cloud (rclone)"
     var id: String { rawValue }
 }
 
@@ -29,11 +30,18 @@ final class Endpoint {
     var keyPath: String = ""
     var password: String = ""
 
+    // Cloud: a remote from the user's rclone config, and a path within it.
+    var cloudRemote: String = ""
+    var cloudPath: String = ""
+
     init(label: String) {
         self.label = label
     }
 
+    /// An SSH host. Cloud endpoints aren't "remote" in this sense: rsync
+    /// can't reach them, only rclone can.
     var isRemote: Bool { kind == .remote }
+    var isCloud: Bool { kind == .cloud }
 
     var portNumber: Int {
         Int(port) ?? 22
@@ -41,13 +49,27 @@ final class Endpoint {
 
     /// The path portion regardless of local/remote.
     var path: String {
-        get { isRemote ? remotePath : localPath }
+        get {
+            switch kind {
+            case .local: return localPath
+            case .remote: return remotePath
+            case .cloud: return cloudPath
+            }
+        }
         set {
-            if isRemote { remotePath = newValue } else { localPath = newValue }
+            switch kind {
+            case .local: localPath = newValue
+            case .remote: remotePath = newValue
+            case .cloud: cloudPath = newValue
+            }
         }
     }
 
     var isValid: Bool {
+        if isCloud {
+            // An empty path is the remote's root, which is a fine target.
+            return !cloudRemote.isEmpty
+        }
         if isRemote {
             return !host.trimmingCharacters(in: .whitespaces).isEmpty
                 && !username.trimmingCharacters(in: .whitespaces).isEmpty
@@ -69,7 +91,11 @@ final class Endpoint {
     var resolvedLocationKey: String {
         var p = path.trimmingCharacters(in: .whitespaces)
         while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
-        return isRemote ? "\(username)@\(host):\(port)/\(p)" : "local:\(p)"
+        switch kind {
+        case .local: return "local:\(p)"
+        case .remote: return "\(username)@\(host):\(port)/\(p)"
+        case .cloud: return "cloud:\(cloudRemote):\(p)"
+        }
     }
 
     /// Swaps every field except `label`, so this endpoint keeps its identity
@@ -79,5 +105,6 @@ final class Endpoint {
         (kind, localPath, host, port, username, remotePath, authMethod, keyPath, password) =
             (other.kind, other.localPath, other.host, other.port, other.username, other.remotePath, other.authMethod, other.keyPath, other.password)
         (other.kind, other.localPath, other.host, other.port, other.username, other.remotePath, other.authMethod, other.keyPath, other.password) = mine
+        (cloudRemote, cloudPath, other.cloudRemote, other.cloudPath) = (other.cloudRemote, other.cloudPath, cloudRemote, cloudPath)
     }
 }

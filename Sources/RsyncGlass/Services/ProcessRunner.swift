@@ -17,23 +17,54 @@ enum ProcessRunner {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
+        // Drain both pipes while the process runs, not after it exits: a pipe
+        // holds 64KB, and a process that fills it blocks on the write and
+        // never exits — so waiting for exit before reading would hang for
+        // good on any large output, like a folder with thousands of entries.
+        let drained = DispatchGroup()
+        let collected = Collected()
+        for (pipe, isStdout) in [(stdoutPipe, true), (stderrPipe, false)] {
+            drained.enter()
+            DispatchQueue.global().async {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                collected.store(data, isStdout: isStdout)
+                drained.leave()
+            }
+        }
+
         return try await withCheckedThrowingContinuation { continuation in
             process.terminationHandler = { proc in
-                let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                let result = ProcessResult(
-                    stdout: String(data: outData, encoding: .utf8) ?? "",
-                    stderr: String(data: errData, encoding: .utf8) ?? "",
-                    exitCode: proc.terminationStatus
-                )
-                continuation.resume(returning: result)
+                drained.notify(queue: .global()) {
+                    continuation.resume(returning: ProcessResult(
+                        stdout: String(data: collected.stdout, encoding: .utf8) ?? "",
+                        stderr: String(data: collected.stderr, encoding: .utf8) ?? "",
+                        exitCode: proc.terminationStatus
+                    ))
+                }
             }
             do {
                 try process.run()
                 onStart?(process)
             } catch {
+                // The readers are blocked on pipes nothing will ever write
+                // to; closing our write ends lets them see EOF and finish.
+                try? stdoutPipe.fileHandleForWriting.close()
+                try? stderrPipe.fileHandleForWriting.close()
                 continuation.resume(throwing: error)
             }
         }
     }
+}
+
+private final class Collected: @unchecked Sendable {
+    private let lock = NSLock()
+    private var out = Data()
+    private var err = Data()
+
+    func store(_ data: Data, isStdout: Bool) {
+        lock.withLock { if isStdout { out = data } else { err = data } }
+    }
+
+    var stdout: Data { lock.withLock { out } }
+    var stderr: Data { lock.withLock { err } }
 }

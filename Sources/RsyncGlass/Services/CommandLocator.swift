@@ -74,4 +74,5 @@ enum CommandLocator {
     static var rsync: String? { find("rsync") }
     static var ssh: String? { find("ssh") }
     static var sshpass: String? { find("sshpass") }
+    static var rclone: String? { find("rclone") }
 }

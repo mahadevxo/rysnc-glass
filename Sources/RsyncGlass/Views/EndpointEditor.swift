@@ -28,6 +28,7 @@ struct EndpointEditor: View {
     @State private var pendingSheet: EndpointSheet?
     @State private var saveName = ""
     @State private var editingServer: SavedServer?
+    @State private var cloudRemotes: [String]?
 
     private func present(_ sheet: EndpointSheet) {
         if activeSheet == nil {
@@ -52,10 +53,10 @@ struct EndpointEditor: View {
             .labelsHidden()
             .alignmentGuide(.endpointRow) { d in d[VerticalAlignment.center] }
 
-            if endpoint.kind == .local {
-                localFields
-            } else {
-                remoteFields
+            switch endpoint.kind {
+            case .local: localFields
+            case .remote: remoteFields
+            case .cloud: cloudFields
             }
         }
         .frame(minWidth: 340)
@@ -166,6 +167,32 @@ struct EndpointEditor: View {
                 .fieldStyle()
             Button("Browse…") { browseFolder() }
         }
+    }
+
+    private var cloudFields: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Picker("Remote", selection: $endpoint.cloudRemote) {
+                    Text("Choose…").tag("")
+                    ForEach(cloudRemotes ?? [], id: \.self) { Text($0).tag($0) }
+                }
+                Button {
+                    Task { cloudRemotes = await RcloneEngine.listRemotes() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Reload remotes from your rclone config")
+            }
+            TextField("path/in/remote (empty for its root)", text: $endpoint.cloudPath)
+                .fieldStyle()
+            Text(cloudRemotes?.isEmpty == true
+                 ? "No remotes in your rclone config yet. Add one in Terminal with: rclone config"
+                 : "Remotes come from your rclone config. Transfers involving cloud storage run with rclone.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .task { if cloudRemotes == nil { cloudRemotes = await RcloneEngine.listRemotes() } }
     }
 
     private var remoteFields: some View {

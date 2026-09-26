@@ -73,4 +73,41 @@ final class RsyncOptionsTests: XCTestCase {
         options.extraArgs = "--exclude-from=list.txt --stats"
         XCTAssertEqual(options.extraArgList, ["--exclude-from=list.txt", "--stats"])
     }
+
+    // MARK: - Network tuning
+
+    func testLocalNetworkDropsCompressionButKeepsDeltaTransferForResume() {
+        let options = RsyncOptions()
+        let lan = options.baseFlags(onLocalNetwork: true)
+        XCTAssertFalse(lan.contains("-z"))
+        XCTAssertFalse(lan.contains("-W"), "whole-file mode would make --partial resend an interrupted file from scratch")
+        XCTAssertTrue(options.baseFlags(onLocalNetwork: false).contains("-z"))
+    }
+
+    func testAutomaticProfileFollowsTheHost() {
+        let options = RsyncOptions()
+        XCTAssertTrue(options.isLocalNetwork(host: "192.168.0.3"))
+        XCTAssertTrue(options.isLocalNetwork(host: nil), "both sides on this Mac")
+        XCTAssertFalse(options.isLocalNetwork(host: "8.8.8.8"))
+        options.network = .internet
+        XCTAssertFalse(options.isLocalNetwork(host: "192.168.0.3"))
+        options.network = .localNetwork
+        XCTAssertTrue(options.isLocalNetwork(host: "8.8.8.8"))
+    }
+
+    func testPrivateAddressRanges() {
+        for local in ["10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.0.3", "127.0.0.1", "169.254.1.1", "::1", "fd12::1", "fe80::1%en0", "[fe80::1]"] {
+            XCTAssertEqual(NetworkClassifier.isPrivateAddress(local), true, local)
+        }
+        for remote in ["8.8.8.8", "172.32.0.1", "100.100.1.1", "2606:4700::1111"] {
+            XCTAssertEqual(NetworkClassifier.isPrivateAddress(remote), false, remote)
+        }
+        XCTAssertNil(NetworkClassifier.isPrivateAddress("nas.example.com"))
+    }
+
+    func testHostnamesClassifyByNameOrResolution() {
+        XCTAssertTrue(NetworkClassifier.isLocal(host: "localhost"))
+        XCTAssertTrue(NetworkClassifier.isLocal(host: "my-nas.local"))
+        XCTAssertFalse(NetworkClassifier.isLocal(host: "definitely-not-a-real-host.invalid"), "unresolvable names default to internet tuning")
+    }
 }
